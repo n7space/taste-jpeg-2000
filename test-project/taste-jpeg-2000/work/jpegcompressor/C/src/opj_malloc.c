@@ -32,218 +32,413 @@
 #define OPJ_SKIP_POISON
 #include "opj_includes.h"
 
-#if defined(OPJ_HAVE_MALLOC_H) && defined(OPJ_HAVE_MEMALIGN)
-# include <malloc.h>
-#endif
-
 #ifndef SIZE_MAX
 # define SIZE_MAX ((size_t) -1)
 #endif
 
-static INLINE void *opj_aligned_alloc_n(size_t alignment, size_t size)
+/*
+ * Static memory pool allocator.
+ *
+ * No dynamic memory allocation is performed: every allocation of the library
+ * is served from a single buffer provided by the user with
+ * opj_mem_pool_init() (typically a statically allocated array).
+ *
+ * The pool is split into blocks, each starting with a header holding its own
+ * size and the size of the physically preceding block, so neighbouring free
+ * blocks can be merged in constant time. Free blocks are kept in an address
+ * ordered, doubly linked list (links stored in the free block payload) and
+ * allocation is first fit. A zero sized "in use" sentinel block terminates
+ * the pool.
+ *
+ * Every returned pointer is aligned to OPJ_MEM_ALIGN bytes; larger alignments
+ * are obtained by splitting off a free block in front of the allocation.
+ *
+ * The pool is not thread-safe.
+ */
+
+/* Alignment of every block and of every returned pointer */
+#define OPJ_MEM_ALIGN 16U
+
+#define OPJ_MEM_ROUND_UP(x, a) (((x) + ((a) - 1U)) & ~((size_t)(a) - 1U))
+
+/* "In use" flag, stored in bit 0 of opj_mem_block_t::size */
+#define OPJ_MEM_USED ((size_t)1U)
+
+/* Header in front of every block, used or free */
+typedef struct opj_mem_block {
+    /* size of the whole block in bytes, header included, ORed with OPJ_MEM_USED */
+    size_t size;
+    /* size of the physically preceding block, 0 for the first block */
+    size_t prev_size;
+} opj_mem_block_t;
+
+/* Free list links, stored in the payload of free blocks */
+typedef struct opj_mem_links {
+    opj_mem_block_t *prev;
+    opj_mem_block_t *next;
+} opj_mem_links_t;
+
+#define OPJ_MEM_HDR_SIZE \
+    OPJ_MEM_ROUND_UP(sizeof(opj_mem_block_t), OPJ_MEM_ALIGN)
+#define OPJ_MEM_MIN_BLOCK \
+    OPJ_MEM_ROUND_UP(OPJ_MEM_HDR_SIZE + sizeof(opj_mem_links_t), OPJ_MEM_ALIGN)
+
+static opj_mem_block_t *opj_mem_free_list = NULL;
+static OPJ_BOOL opj_mem_initialized = OPJ_FALSE;
+static size_t opj_mem_used = 0U;
+static size_t opj_mem_peak = 0U;
+
+static INLINE size_t opj_mem_size(const opj_mem_block_t *b)
 {
-    void* ptr;
+    return b->size & ~OPJ_MEM_USED;
+}
+
+static INLINE OPJ_BOOL opj_mem_is_used(const opj_mem_block_t *b)
+{
+    return (b->size & OPJ_MEM_USED) != 0U;
+}
+
+static INLINE opj_mem_links_t *opj_mem_links(opj_mem_block_t *b)
+{
+    return (opj_mem_links_t *)(void *)((OPJ_UINT8 *)b + OPJ_MEM_HDR_SIZE);
+}
+
+static INLINE opj_mem_block_t *opj_mem_next(opj_mem_block_t *b)
+{
+    return (opj_mem_block_t *)(void *)((OPJ_UINT8 *)b + opj_mem_size(b));
+}
+
+static INLINE opj_mem_block_t *opj_mem_prev(opj_mem_block_t *b)
+{
+    if (b->prev_size == 0U) {
+        return NULL;
+    }
+    return (opj_mem_block_t *)(void *)((OPJ_UINT8 *)b - b->prev_size);
+}
+
+static INLINE void *opj_mem_payload(opj_mem_block_t *b)
+{
+    return (OPJ_UINT8 *)b + OPJ_MEM_HDR_SIZE;
+}
+
+static INLINE opj_mem_block_t *opj_mem_block_of(void *ptr)
+{
+    return (opj_mem_block_t *)(void *)((OPJ_UINT8 *)ptr - OPJ_MEM_HDR_SIZE);
+}
+
+/* Set the size and state of a block, keeping the next block's back link */
+static INLINE void opj_mem_set(opj_mem_block_t *b, size_t size, size_t used)
+{
+    b->size = size | used;
+    opj_mem_next(b)->prev_size = size;
+}
+
+static INLINE void opj_mem_account(size_t freed, size_t allocated)
+{
+    opj_mem_used = opj_mem_used - freed + allocated;
+    if (opj_mem_used > opj_mem_peak) {
+        opj_mem_peak = opj_mem_used;
+    }
+}
+
+static void opj_mem_list_insert(opj_mem_block_t *b)
+{
+    opj_mem_block_t *prev = NULL;
+    opj_mem_block_t *next = opj_mem_free_list;
+
+    while ((next != NULL) && (next < b)) {
+        prev = next;
+        next = opj_mem_links(next)->next;
+    }
+    opj_mem_links(b)->prev = prev;
+    opj_mem_links(b)->next = next;
+    if (prev != NULL) {
+        opj_mem_links(prev)->next = b;
+    } else {
+        opj_mem_free_list = b;
+    }
+    if (next != NULL) {
+        opj_mem_links(next)->prev = b;
+    }
+}
+
+static void opj_mem_list_remove(opj_mem_block_t *b)
+{
+    opj_mem_block_t *prev = opj_mem_links(b)->prev;
+    opj_mem_block_t *next = opj_mem_links(b)->next;
+
+    if (prev != NULL) {
+        opj_mem_links(prev)->next = next;
+    } else {
+        opj_mem_free_list = next;
+    }
+    if (next != NULL) {
+        opj_mem_links(next)->prev = prev;
+    }
+}
+
+/* Turn a block that is not in the free list into a free block, merging it
+ * with its free neighbours */
+static void opj_mem_release(opj_mem_block_t *b)
+{
+    size_t size = opj_mem_size(b);
+    opj_mem_block_t *next = opj_mem_next(b);
+    opj_mem_block_t *prev = opj_mem_prev(b);
+
+    if (!opj_mem_is_used(next)) {
+        opj_mem_list_remove(next);
+        size += opj_mem_size(next);
+    }
+    if ((prev != NULL) && !opj_mem_is_used(prev)) {
+        /* prev already is in the free list, just grow it */
+        opj_mem_set(prev, opj_mem_size(prev) + size, 0U);
+    } else {
+        opj_mem_set(b, size, 0U);
+        opj_mem_list_insert(b);
+    }
+}
+
+/* Reduce a used block to block_size bytes, releasing the tail if large
+ * enough to form a block */
+static void opj_mem_shrink(opj_mem_block_t *b, size_t block_size)
+{
+    size_t size = opj_mem_size(b);
+
+    if (size - block_size >= OPJ_MEM_MIN_BLOCK) {
+        opj_mem_block_t *rest;
+
+        opj_mem_set(b, block_size, OPJ_MEM_USED);
+        rest = opj_mem_next(b);
+        opj_mem_set(rest, size - block_size, OPJ_MEM_USED);
+        opj_mem_release(rest);
+    }
+}
+
+/* Block size needed to hold size bytes of payload, 0 on overflow */
+static INLINE size_t opj_mem_block_size(size_t size)
+{
+    size_t block_size;
+
+    if (size > SIZE_MAX - OPJ_MEM_HDR_SIZE - OPJ_MEM_ALIGN) {
+        return 0U;
+    }
+    block_size = OPJ_MEM_ROUND_UP(size + OPJ_MEM_HDR_SIZE, OPJ_MEM_ALIGN);
+    if (block_size < OPJ_MEM_MIN_BLOCK) {
+        block_size = OPJ_MEM_MIN_BLOCK;
+    }
+    return block_size;
+}
+
+static void *opj_mem_alloc(size_t alignment, size_t size)
+{
+    opj_mem_block_t *b;
+    size_t block_size;
+    size_t gap = 0U;
 
     /* alignment shall be power of 2 */
     assert((alignment != 0U) && ((alignment & (alignment - 1U)) == 0U));
-    /* alignment shall be at least sizeof(void*) */
-    assert(alignment >= sizeof(void*));
 
-    if (size == 0U) { /* prevent implementation defined behavior of realloc */
+    if ((size == 0U) || !opj_mem_initialized) {
+        return NULL;
+    }
+    block_size = opj_mem_block_size(size);
+    if (block_size == 0U) {
         return NULL;
     }
 
-#if defined(OPJ_HAVE_POSIX_MEMALIGN)
-    /* aligned_alloc requires c11, restrict to posix_memalign for now. Quote:
-     * This function was introduced in POSIX 1003.1d. Although this function is
-     * superseded by aligned_alloc, it is more portable to older POSIX systems
-     * that do not support ISO C11.  */
-    if (posix_memalign(&ptr, alignment, size)) {
-        ptr = NULL;
-    }
-    /* older linux */
-#elif defined(OPJ_HAVE_MEMALIGN)
-    ptr = memalign(alignment, size);
-    /* _MSC_VER */
-#elif defined(OPJ_HAVE__ALIGNED_MALLOC)
-    ptr = _aligned_malloc(size, alignment);
-#else
-    /*
-     * Generic aligned malloc implementation.
-     * Uses size_t offset for the integer manipulation of the pointer,
-     * as uintptr_t is not available in C89 to do
-     * bitwise operations on the pointer itself.
-     */
-    alignment--;
-    {
-        size_t offset;
-        OPJ_UINT8 *mem;
+    /* first fit */
+    for (b = opj_mem_free_list; b != NULL; b = opj_mem_links(b)->next) {
+        size_t b_size = opj_mem_size(b);
 
-        /* Room for padding and extra pointer stored in front of allocated area */
-        size_t overhead = alignment + sizeof(void *);
-
-        /* let's be extra careful */
-        assert(alignment <= (SIZE_MAX - sizeof(void *)));
-
-        /* Avoid integer overflow */
-        if (size > (SIZE_MAX - overhead)) {
-            return NULL;
+        if (alignment > OPJ_MEM_ALIGN) {
+            /* we simply use `size_t` to cast, since we are only interest in
+             * binary AND operator */
+            gap = (alignment - ((size_t)opj_mem_payload(b) & (alignment - 1U))) &
+                  (alignment - 1U);
+            /* the gap in front becomes a free block, so it must be big enough */
+            while ((gap != 0U) && (gap < OPJ_MEM_MIN_BLOCK)) {
+                gap += alignment;
+            }
         }
-
-        mem = (OPJ_UINT8*)malloc(size + overhead);
-        if (mem == NULL) {
-            return mem;
+        if ((b_size >= gap) && (b_size - gap >= block_size)) {
+            break;
         }
-        /* offset = ((alignment + 1U) - ((size_t)(mem + sizeof(void*)) & alignment)) & alignment; */
-        /* Use the fact that alignment + 1U is a power of 2 */
-        offset = ((alignment ^ ((size_t)(mem + sizeof(void*)) & alignment)) + 1U) &
-                 alignment;
-        ptr = (void *)(mem + sizeof(void*) + offset);
-        ((void**) ptr)[-1] = mem;
     }
-#endif
-    return ptr;
+    if (b == NULL) {
+        return NULL;
+    }
+
+    if (gap != 0U) {
+        /* keep the gap as a free block, it stays in place in the free list */
+        size_t b_size = opj_mem_size(b);
+
+        opj_mem_set(b, gap, 0U);
+        b = opj_mem_next(b);
+        opj_mem_set(b, b_size - gap, OPJ_MEM_USED);
+    } else {
+        opj_mem_list_remove(b);
+        opj_mem_set(b, opj_mem_size(b), OPJ_MEM_USED);
+    }
+    opj_mem_shrink(b, block_size);
+    opj_mem_account(0U, opj_mem_size(b));
+
+    return opj_mem_payload(b);
 }
-static INLINE void *opj_aligned_realloc_n(void *ptr, size_t alignment,
-        size_t new_size)
-{
-    void *r_ptr;
 
-    /* alignment shall be power of 2 */
-    assert((alignment != 0U) && ((alignment & (alignment - 1U)) == 0U));
-    /* alignment shall be at least sizeof(void*) */
-    assert(alignment >= sizeof(void*));
+static void *opj_mem_realloc(void *ptr, size_t alignment, size_t new_size)
+{
+    opj_mem_block_t *b;
+    opj_mem_block_t *next;
+    size_t block_size;
+    size_t old_size;
+    void *new_ptr;
 
     if (new_size == 0U) { /* prevent implementation defined behavior of realloc */
         return NULL;
     }
-
-    /* no portable aligned realloc */
-#if defined(OPJ_HAVE_POSIX_MEMALIGN) || defined(OPJ_HAVE_MEMALIGN)
-    /* glibc doc states one can mix aligned malloc with realloc */
-    r_ptr = realloc(ptr, new_size);   /* fast path */
-    /* we simply use `size_t` to cast, since we are only interest in binary AND
-     * operator */
-    if (((size_t)r_ptr & (alignment - 1U)) != 0U) {
-        /* this is non-trivial to implement a portable aligned realloc, so use a
-         * simple approach where we do not need a function that return the size of an
-         * allocated array (eg. _msize on Windows, malloc_size on MacOS,
-         * malloc_usable_size on systems with glibc) */
-        void *a_ptr = opj_aligned_alloc_n(alignment, new_size);
-        if (a_ptr != NULL) {
-            memcpy(a_ptr, r_ptr, new_size);
-        }
-        free(r_ptr);
-        r_ptr = a_ptr;
-    }
-    /* _MSC_VER */
-#elif defined(OPJ_HAVE__ALIGNED_MALLOC)
-    r_ptr = _aligned_realloc(ptr, new_size, alignment);
-#else
     if (ptr == NULL) {
-        return opj_aligned_alloc_n(alignment, new_size);
+        return opj_mem_alloc(alignment, new_size);
     }
-    alignment--;
-    {
-        void *oldmem;
-        OPJ_UINT8 *newmem;
-        size_t overhead = alignment + sizeof(void *);
-
-        /* let's be extra careful */
-        assert(alignment <= (SIZE_MAX - sizeof(void *)));
-
-        /* Avoid integer overflow */
-        if (new_size > SIZE_MAX - overhead) {
-            return NULL;
-        }
-
-        oldmem = ((void**) ptr)[-1];
-        newmem = (OPJ_UINT8*)realloc(oldmem, new_size + overhead);
-        if (newmem == NULL) {
-            return newmem;
-        }
-
-        if (newmem == oldmem) {
-            r_ptr = ptr;
-        } else {
-            size_t old_offset;
-            size_t new_offset;
-
-            /* realloc created a new copy, realign the copied memory block */
-            old_offset = (size_t)((OPJ_UINT8*)ptr - (OPJ_UINT8*)oldmem);
-
-            /* offset = ((alignment + 1U) - ((size_t)(mem + sizeof(void*)) & alignment)) & alignment; */
-            /* Use the fact that alignment + 1U is a power of 2 */
-            new_offset  = ((alignment ^ ((size_t)(newmem + sizeof(void*)) & alignment)) +
-                           1U) & alignment;
-            new_offset += sizeof(void*);
-            r_ptr = (void *)(newmem + new_offset);
-
-            if (new_offset != old_offset) {
-                memmove(newmem + new_offset, newmem + old_offset, new_size);
-            }
-            ((void**) r_ptr)[-1] = newmem;
-        }
-    }
-#endif
-    return r_ptr;
-}
-void * opj_malloc(size_t size)
-{
-    if (size == 0U) { /* prevent implementation defined behavior of realloc */
+    block_size = opj_mem_block_size(new_size);
+    if (block_size == 0U) {
         return NULL;
     }
-    return malloc(size);
+
+    b = opj_mem_block_of(ptr);
+    assert(opj_mem_is_used(b));
+    old_size = opj_mem_size(b);
+
+    /* resize in place (keeps alignment): shrink, or grow into next free block */
+    next = opj_mem_next(b);
+    if (block_size <= old_size) {
+        opj_mem_shrink(b, block_size);
+        opj_mem_account(old_size, opj_mem_size(b));
+        return ptr;
+    }
+    if (!opj_mem_is_used(next) &&
+            (old_size + opj_mem_size(next) >= block_size)) {
+        opj_mem_list_remove(next);
+        opj_mem_set(b, old_size + opj_mem_size(next), OPJ_MEM_USED);
+        opj_mem_shrink(b, block_size);
+        opj_mem_account(old_size, opj_mem_size(b));
+        return ptr;
+    }
+
+    /* move; on failure the original block is left untouched */
+    new_ptr = opj_mem_alloc(alignment, new_size);
+    if (new_ptr == NULL) {
+        return NULL;
+    }
+    memcpy(new_ptr, ptr, old_size - OPJ_MEM_HDR_SIZE);
+    opj_free(ptr);
+    return new_ptr;
+}
+
+OPJ_BOOL OPJ_CALLCONV opj_mem_pool_init(void *buffer, OPJ_SIZE_T size)
+{
+    OPJ_UINT8 *start;
+    size_t misalignment;
+    opj_mem_block_t *first;
+    opj_mem_block_t *sentinel;
+
+    opj_mem_initialized = OPJ_FALSE;
+    opj_mem_free_list = NULL;
+    opj_mem_used = 0U;
+    opj_mem_peak = 0U;
+
+    if (buffer == NULL) {
+        return OPJ_FALSE;
+    }
+    misalignment = (OPJ_MEM_ALIGN - ((size_t)buffer & (OPJ_MEM_ALIGN - 1U))) &
+                   (OPJ_MEM_ALIGN - 1U);
+    if (size < misalignment + OPJ_MEM_MIN_BLOCK + OPJ_MEM_HDR_SIZE) {
+        return OPJ_FALSE;
+    }
+    start = (OPJ_UINT8 *)buffer + misalignment;
+    size = (size - misalignment) & ~((size_t)OPJ_MEM_ALIGN - 1U);
+
+    first = (opj_mem_block_t *)(void *)start;
+    first->prev_size = 0U;
+    opj_mem_set(first, size - OPJ_MEM_HDR_SIZE, 0U);
+    sentinel = opj_mem_next(first);
+    sentinel->size = OPJ_MEM_USED;
+
+    opj_mem_links(first)->prev = NULL;
+    opj_mem_links(first)->next = NULL;
+    opj_mem_free_list = first;
+    opj_mem_initialized = OPJ_TRUE;
+
+    return OPJ_TRUE;
+}
+
+OPJ_SIZE_T OPJ_CALLCONV opj_mem_pool_get_used(void)
+{
+    return opj_mem_used;
+}
+
+OPJ_SIZE_T OPJ_CALLCONV opj_mem_pool_get_peak(void)
+{
+    return opj_mem_peak;
+}
+
+void * opj_malloc(size_t size)
+{
+    return opj_mem_alloc(OPJ_MEM_ALIGN, size);
 }
 void * opj_calloc(size_t num, size_t size)
 {
+    void *ptr;
+
     if (num == 0 || size == 0) {
         /* prevent implementation defined behavior of realloc */
         return NULL;
     }
-    return calloc(num, size);
+    if (num > SIZE_MAX / size) {
+        return NULL;
+    }
+    ptr = opj_mem_alloc(OPJ_MEM_ALIGN, num * size);
+    if (ptr != NULL) {
+        memset(ptr, 0, num * size);
+    }
+    return ptr;
 }
 
 void *opj_aligned_malloc(size_t size)
 {
-    return opj_aligned_alloc_n(16U, size);
+    return opj_mem_alloc(16U, size);
 }
 void * opj_aligned_realloc(void *ptr, size_t size)
 {
-    return opj_aligned_realloc_n(ptr, 16U, size);
+    return opj_mem_realloc(ptr, 16U, size);
 }
 
 void *opj_aligned_32_malloc(size_t size)
 {
-    return opj_aligned_alloc_n(32U, size);
+    return opj_mem_alloc(32U, size);
 }
 void * opj_aligned_32_realloc(void *ptr, size_t size)
 {
-    return opj_aligned_realloc_n(ptr, 32U, size);
+    return opj_mem_realloc(ptr, 32U, size);
 }
 
 void opj_aligned_free(void* ptr)
 {
-#if defined(OPJ_HAVE_POSIX_MEMALIGN) || defined(OPJ_HAVE_MEMALIGN)
-    free(ptr);
-#elif defined(OPJ_HAVE__ALIGNED_MALLOC)
-    _aligned_free(ptr);
-#else
-    /* Generic implementation has malloced pointer stored in front of used area */
-    if (ptr != NULL) {
-        free(((void**) ptr)[-1]);
-    }
-#endif
+    opj_free(ptr);
 }
 
 void * opj_realloc(void *ptr, size_t new_size)
 {
-    if (new_size == 0U) { /* prevent implementation defined behavior of realloc */
-        return NULL;
-    }
-    return realloc(ptr, new_size);
+    return opj_mem_realloc(ptr, OPJ_MEM_ALIGN, new_size);
 }
 void opj_free(void *ptr)
 {
-    free(ptr);
+    opj_mem_block_t *b;
+
+    if (ptr == NULL) {
+        return;
+    }
+    b = opj_mem_block_of(ptr);
+    assert(opj_mem_is_used(b));
+    opj_mem_account(opj_mem_size(b), 0U);
+    opj_mem_release(b);
 }

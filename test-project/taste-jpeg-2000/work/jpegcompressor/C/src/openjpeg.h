@@ -1164,6 +1164,38 @@ OPJ_API void OPJ_CALLCONV opj_image_data_free(void* ptr);
 
 /*
 ==========================================================
+   static memory pool functions definitions
+==========================================================
+*/
+
+/**
+ * Set the memory pool used by all OpenJPEG allocations.
+ * No dynamic memory allocation (malloc/free) is ever performed by the
+ * library: every allocation is served from the buffer given here.
+ * Must be called before any other OpenJPEG function. Calling it again
+ * discards everything that was allocated from the previous pool.
+ * The pool is not thread-safe: do not use opj_codec_set_threads().
+ *
+ * @param   buffer  memory (typically a static array) used as the pool
+ * @param   size    size of the buffer in bytes
+ *
+ * @return  OPJ_TRUE if the pool was set, OPJ_FALSE if the buffer is too small.
+*/
+OPJ_API OPJ_BOOL OPJ_CALLCONV opj_mem_pool_init(void* buffer, OPJ_SIZE_T size);
+
+/**
+ * @return  number of pool bytes currently in use (including block headers).
+*/
+OPJ_API OPJ_SIZE_T OPJ_CALLCONV opj_mem_pool_get_used(void);
+
+/**
+ * @return  the highest number of pool bytes in use since opj_mem_pool_init(),
+ *          useful to size the pool buffer.
+*/
+OPJ_API OPJ_SIZE_T OPJ_CALLCONV opj_mem_pool_get_peak(void);
+
+/*
+==========================================================
    stream functions definitions
 ==========================================================
 */

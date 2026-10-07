@@ -8,7 +8,20 @@
     !! file. The up-to-date signatures can be found in the header file. !!
 */
 #include "jpegcompressor.h"
+#include "openjpeg.h"
 //#include <stdio.h>
+
+// Size of the static memory pool used by OpenJPEG for all its allocations.
+// Tune it to the image size and encoder parameters, using
+// opj_mem_pool_get_peak() after a compression to see the actual need.
+#ifndef JPEGCOMPRESSOR_MEM_POOL_SIZE
+#define JPEGCOMPRESSOR_MEM_POOL_SIZE (8U * 1024U * 1024U)
+#endif
+
+static OPJ_UINT8 opj_pool_buffer[JPEGCOMPRESSOR_MEM_POOL_SIZE];
+
+// Encoder parameters, kept static as the structure is ~18 KB (too big for the stack)
+static opj_cparameters_t encoder_parameters;
 
 
 void jpegcompressor_startup(void)
@@ -16,6 +29,8 @@ void jpegcompressor_startup(void)
    // Write your initialisation code
    // You may call sporadic required interfaces and start timers
    // puts ("[JpegCompressor] Startup");
+   opj_mem_pool_init(opj_pool_buffer, sizeof(opj_pool_buffer));
+   opj_set_default_encoder_parameters(&encoder_parameters);
 }
 
 void jpegcompressor_PI_clear_buffer(void)
