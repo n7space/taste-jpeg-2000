@@ -20,16 +20,17 @@
  *      Layout: planar (all samples of component 0, then component 1, ...),
  *      each component row by row; 1 byte per sample for bit-depth <= 8,
  *      otherwise 2 bytes per sample, little endian.
- *   2. start_compression: compress the uploaded image with the given
- *      configuration; compression_completed is sent when done.
+ *   2. start_compression: compress the uploaded image into a raw JPEG 2000
+ *      codestream; compression_completed is sent when done.
  *   3. read_buffer: download the compressed data in chunks.
  *   status can be called at any time, clear_buffer forgets the uploaded and
  *   compressed data.
  *
- * Memory: all buffers below are static. The image is fed to OpenJPEG tile
- * by tile (opj_write_tile), so the encoder pool only holds the data of one
- * tile, not of the whole image. Use the status memory-peak field after a
- * compression to tune JPEGCOMPRESSOR_MEM_POOL_SIZE.
+ * Memory: three static buffers (pool, input, output). The image is fed to
+ * OpenJPEG tile by tile (opj_write_tile), so the pool only needs to hold the
+ * encoder working data of one tile, not of the whole image. The status
+ * memory-peak field gives the pool usage of the last compression, to tune
+ * JPEGCOMPRESSOR_MEM_POOL_SIZE.
  */
 
 // Encoder memory pool, used by OpenJPEG for all its allocations
@@ -47,12 +48,6 @@
 #define JPEGCOMPRESSOR_OUTPUT_BUFFER_SIZE (1024U * 1024U)
 #endif
 
-// Buffer used to gather the samples of one tile, bounds the tile size.
-// Not needed (and may be 0) when images are compressed as a single tile.
-#ifndef JPEGCOMPRESSOR_TILE_BUFFER_SIZE
-#define JPEGCOMPRESSOR_TILE_BUFFER_SIZE (256U * 1024U)
-#endif
-
 // Size of the OpenJPEG stream internal buffer (allocated from the pool)
 #ifndef JPEGCOMPRESSOR_STREAM_CHUNK_SIZE
 #define JPEGCOMPRESSOR_STREAM_CHUNK_SIZE (4096U)
@@ -64,12 +59,6 @@
 static OPJ_UINT64 opj_pool_buffer[JPEGCOMPRESSOR_WORDS(JPEGCOMPRESSOR_MEM_POOL_SIZE)];
 static OPJ_UINT64 input_words[JPEGCOMPRESSOR_WORDS(JPEGCOMPRESSOR_INPUT_BUFFER_SIZE)];
 static OPJ_UINT64 output_words[JPEGCOMPRESSOR_WORDS(JPEGCOMPRESSOR_OUTPUT_BUFFER_SIZE)];
-#if JPEGCOMPRESSOR_TILE_BUFFER_SIZE > 0
-static OPJ_UINT64 tile_words[JPEGCOMPRESSOR_WORDS(JPEGCOMPRESSOR_TILE_BUFFER_SIZE)];
-#define TILE_BUFFER ((OPJ_UINT8 *)tile_words)
-#else
-#define TILE_BUFFER ((OPJ_UINT8 *)NULL)
-#endif
 
 #define INPUT_BUFFER  ((OPJ_UINT8 *)input_words)
 #define OUTPUT_BUFFER ((OPJ_UINT8 *)output_words)
@@ -82,8 +71,7 @@ static struct {
    asn1SccJpeg_Result_Code last_result;
    OPJ_SIZE_T input_size;       // highest uploaded byte + 1
    OPJ_SIZE_T output_size;      // compressed bytes available
-   OPJ_SIZE_T output_position;  // stream position while compressing
-   OPJ_BOOL output_overflow;    // the stream tried to write past the buffer
+   OPJ_BOOL output_overflow;    // the compressed data did not fit
 } compressor;
 
 // Image geometry derived from the configuration
@@ -100,49 +88,17 @@ typedef struct {
 } image_geometry_t;
 
 
-/* ---------------------------------------------------------------------- */
-/* OpenJPEG output stream writing into OUTPUT_BUFFER                       */
-/* ---------------------------------------------------------------------- */
-
+// OpenJPEG output stream: a codestream is written sequentially (no seek)
 static OPJ_SIZE_T stream_write(void *data, OPJ_SIZE_T size, void *user_data)
 {
    (void)user_data;
-   if (size > JPEGCOMPRESSOR_OUTPUT_BUFFER_SIZE - compressor.output_position) {
+   if (size > JPEGCOMPRESSOR_OUTPUT_BUFFER_SIZE - compressor.output_size) {
       compressor.output_overflow = OPJ_TRUE;
       return (OPJ_SIZE_T)-1;
    }
-   memcpy(OUTPUT_BUFFER + compressor.output_position, data, size);
-   compressor.output_position += size;
-   if (compressor.output_position > compressor.output_size) {
-      compressor.output_size = compressor.output_position;
-   }
+   memcpy(OUTPUT_BUFFER + compressor.output_size, data, size);
+   compressor.output_size += size;
    return size;
-}
-
-static OPJ_OFF_T stream_skip(OPJ_OFF_T size, void *user_data)
-{
-   (void)user_data;
-   if ((size < 0) ||
-       ((OPJ_UINT64)size > JPEGCOMPRESSOR_OUTPUT_BUFFER_SIZE - compressor.output_position)) {
-      compressor.output_overflow = OPJ_TRUE;
-      return -1;
-   }
-   compressor.output_position += (OPJ_SIZE_T)size;
-   if (compressor.output_position > compressor.output_size) {
-      compressor.output_size = compressor.output_position;
-   }
-   return size;
-}
-
-static OPJ_BOOL stream_seek(OPJ_OFF_T position, void *user_data)
-{
-   (void)user_data;
-   if ((position < 0) || ((OPJ_UINT64)position > JPEGCOMPRESSOR_OUTPUT_BUFFER_SIZE)) {
-      compressor.output_overflow = OPJ_TRUE;
-      return OPJ_FALSE;
-   }
-   compressor.output_position = (OPJ_SIZE_T)position;
-   return OPJ_TRUE;
 }
 
 
@@ -177,13 +133,6 @@ static asn1SccJpeg_Result_Code check_config(const asn1SccJpeg_Compression_Config
    geometry->tiles_y = (geometry->height + geometry->tile_height - 1U) / geometry->tile_height;
 
    if (geometry->image_size > JPEGCOMPRESSOR_INPUT_BUFFER_SIZE) {
-      return Jpeg_Result_Code_invalid_config;
-   }
-   // Tiles are gathered in TILE_BUFFER, except for a single tile image
-   // which is read directly from INPUT_BUFFER
-   if ((geometry->tiles_x * geometry->tiles_y > 1U) &&
-       ((OPJ_SIZE_T)geometry->tile_width * geometry->tile_height *
-        geometry->num_components * geometry->bytes_per_sample > JPEGCOMPRESSOR_TILE_BUFFER_SIZE)) {
       return Jpeg_Result_Code_invalid_config;
    }
    // OpenJPEG requires tiles of at least 2^(resolutions - 1) pixels
@@ -222,17 +171,19 @@ static void setup_parameters(const asn1SccJpeg_Compression_Config *config)
    parameters->tcp_mct = (config->num_components >= 3U) ? 1 : 0;
 }
 
-// Copy the samples of one tile from INPUT_BUFFER to TILE_BUFFER, in the
+// Copy the samples of one tile from INPUT_BUFFER to tile_buffer, in the
 // layout expected by opj_write_tile (planar, row by row)
-static OPJ_SIZE_T gather_tile(const image_geometry_t *geometry, OPJ_UINT32 tile_x, OPJ_UINT32 tile_y)
+static OPJ_SIZE_T gather_tile(const image_geometry_t *geometry, OPJ_UINT32 tile_x, OPJ_UINT32 tile_y,
+                              OPJ_UINT8 *tile_buffer)
 {
    OPJ_UINT32 x0 = tile_x * geometry->tile_width;
    OPJ_UINT32 y0 = tile_y * geometry->tile_height;
    OPJ_UINT32 width = geometry->width - x0;
    OPJ_UINT32 height = geometry->height - y0;
-   OPJ_SIZE_T plane_size = (OPJ_SIZE_T)geometry->width * geometry->height * geometry->bytes_per_sample;
+   OPJ_SIZE_T line_size = (OPJ_SIZE_T)geometry->width * geometry->bytes_per_sample;
+   OPJ_SIZE_T plane_size = line_size * geometry->height;
    OPJ_SIZE_T row_size;
-   OPJ_UINT8 *destination = TILE_BUFFER;
+   OPJ_UINT8 *destination = tile_buffer;
    OPJ_UINT32 component;
    OPJ_UINT32 row;
 
@@ -246,14 +197,14 @@ static OPJ_SIZE_T gather_tile(const image_geometry_t *geometry, OPJ_UINT32 tile_
 
    for (component = 0U; component < geometry->num_components; component++) {
       const OPJ_UINT8 *source = INPUT_BUFFER + component * plane_size +
-                                ((OPJ_SIZE_T)y0 * geometry->width + x0) * geometry->bytes_per_sample;
+                                y0 * line_size + (OPJ_SIZE_T)x0 * geometry->bytes_per_sample;
       for (row = 0U; row < height; row++) {
          memcpy(destination, source, row_size);
          destination += row_size;
-         source += (OPJ_SIZE_T)geometry->width * geometry->bytes_per_sample;
+         source += line_size;
       }
    }
-   return (OPJ_SIZE_T)(destination - TILE_BUFFER);
+   return (OPJ_SIZE_T)(destination - tile_buffer);
 }
 
 static OPJ_BOOL encode(const asn1SccJpeg_Compression_Config *config, const image_geometry_t *geometry)
@@ -262,7 +213,8 @@ static OPJ_BOOL encode(const asn1SccJpeg_Compression_Config *config, const image
    opj_image_t *image = NULL;
    opj_codec_t *codec = NULL;
    opj_stream_t *stream = NULL;
-   OPJ_COLOR_SPACE color_space;
+   OPJ_UINT8 *tile_buffer = NULL;
+   OPJ_BOOL single_tile = (geometry->tiles_x * geometry->tiles_y == 1U);
    OPJ_BOOL success = OPJ_FALSE;
    OPJ_UINT32 i;
 
@@ -275,36 +227,33 @@ static OPJ_BOOL encode(const asn1SccJpeg_Compression_Config *config, const image
       component_parameters[i].prec = (OPJ_UINT32)config->bit_depth;
       component_parameters[i].sgnd = config->is_signed ? 1U : 0U;
    }
-   if (geometry->num_components == 1U) {
-      color_space = OPJ_CLRSPC_GRAY;
-   } else if (geometry->num_components == 3U) {
-      color_space = OPJ_CLRSPC_SRGB;
-   } else {
-      color_space = OPJ_CLRSPC_UNSPECIFIED;
-   }
 
+   // A single tile is passed directly from INPUT_BUFFER, which already has
+   // the expected layout; otherwise each tile is gathered in a pool buffer
+   if (!single_tile) {
+      tile_buffer = (OPJ_UINT8 *)opj_image_data_alloc((OPJ_SIZE_T)geometry->tile_width *
+                                                      geometry->tile_height * geometry->num_components *
+                                                      geometry->bytes_per_sample);
+   }
    // Image without sample data: samples are given tile by tile
-   image = opj_image_tile_create(geometry->num_components, component_parameters, color_space);
-   codec = opj_create_compress((config->format == Jpeg_Compression_Format_jp2_file) ?
-                               OPJ_CODEC_JP2 : OPJ_CODEC_J2K);
+   image = opj_image_tile_create(geometry->num_components, component_parameters,
+                                 (geometry->num_components == 1U) ? OPJ_CLRSPC_GRAY :
+                                 (geometry->num_components == 3U) ? OPJ_CLRSPC_SRGB :
+                                 OPJ_CLRSPC_UNSPECIFIED);
+   codec = opj_create_compress(OPJ_CODEC_J2K);
    stream = opj_stream_create(JPEGCOMPRESSOR_STREAM_CHUNK_SIZE, OPJ_FALSE);
 
-   if ((image != NULL) && (codec != NULL) && (stream != NULL)) {
+   if ((single_tile || (tile_buffer != NULL)) && (image != NULL) && (codec != NULL) && (stream != NULL)) {
       image->x0 = 0U;
       image->y0 = 0U;
       image->x1 = geometry->width;
       image->y1 = geometry->height;
-      image->color_space = color_space;
-
       opj_stream_set_write_function(stream, stream_write);
-      opj_stream_set_skip_function(stream, stream_skip);
-      opj_stream_set_seek_function(stream, stream_seek);
 
       success = opj_setup_encoder(codec, &encoder_parameters, image) &&
                 opj_start_compress(codec, image, stream);
 
-      if (geometry->tiles_x * geometry->tiles_y == 1U) {
-         // Single tile: INPUT_BUFFER already has the expected layout
+      if (single_tile) {
          success = success &&
                    opj_write_tile(codec, 0U, INPUT_BUFFER, (OPJ_UINT32)geometry->image_size, stream);
       } else {
@@ -313,10 +262,10 @@ static OPJ_BOOL encode(const asn1SccJpeg_Compression_Config *config, const image
 
          for (tile_y = 0U; success && (tile_y < geometry->tiles_y); tile_y++) {
             for (tile_x = 0U; success && (tile_x < geometry->tiles_x); tile_x++) {
-               OPJ_SIZE_T tile_size = gather_tile(geometry, tile_x, tile_y);
+               OPJ_SIZE_T tile_size = gather_tile(geometry, tile_x, tile_y, tile_buffer);
 
                success = opj_write_tile(codec, tile_y * geometry->tiles_x + tile_x,
-                                        TILE_BUFFER, (OPJ_UINT32)tile_size, stream);
+                                        tile_buffer, (OPJ_UINT32)tile_size, stream);
             }
          }
       }
@@ -332,6 +281,7 @@ static OPJ_BOOL encode(const asn1SccJpeg_Compression_Config *config, const image
    if (image != NULL) {
       opj_image_destroy(image);
    }
+   opj_image_data_free(tile_buffer);
    return success;
 }
 
@@ -341,7 +291,6 @@ static asn1SccJpeg_Result_Code compress(const asn1SccJpeg_Compression_Config *co
    asn1SccJpeg_Result_Code result;
 
    compressor.output_size = 0U;
-   compressor.output_position = 0U;
    compressor.output_overflow = OPJ_FALSE;
 
    // Start every compression from an empty pool: nothing can leak from a

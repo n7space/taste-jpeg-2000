@@ -23,11 +23,7 @@ BEGIN
       length   INTEGER (0 .. 1024)
    }
 
-   Jpeg-Compression-Format ::= ENUMERATED {
-      j2k-codestream,   -- raw JPEG 2000 codestream (.j2k)
-      jp2-file          -- JP2 file format (.jp2)
-   }
-
+   -- The output is a raw JPEG 2000 codestream (.j2k)
    Jpeg-Compression-Config ::= SEQUENCE {
       width              INTEGER (1 .. 8192),
       height             INTEGER (1 .. 8192),
@@ -41,8 +37,7 @@ BEGIN
       resolutions        INTEGER (1 .. 10),
       -- tile width and height in pixels, 0: whole image as a single tile.
       -- Tiling reduces the memory needed by the encoder
-      tile-size          INTEGER (0 .. 8192),
-      format             Jpeg-Compression-Format
+      tile-size          INTEGER (0 .. 8192)
    }
 
    Jpeg-Result-Code ::= ENUMERATED {

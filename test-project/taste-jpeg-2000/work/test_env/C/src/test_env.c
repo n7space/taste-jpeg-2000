@@ -17,7 +17,7 @@
  * Each trigger runs one step of the current scenario:
  *   upload the generated image + start_compression, then, once
  *   compression_completed is received, check the result, download the
- *   compressed data and save it as test_output/<name>.(j2k|jp2), together
+ *   compressed data and save it as test_output/<name>.j2k, together
  *   with the raw image (<name>.raw) for an external comparison.
  * The process exits when all scenarios are done (exit code = failures).
  */
@@ -34,21 +34,21 @@ typedef struct {
    asn1SccJpeg_Result_Code expected;
 } scenario_t;
 
-#define CONFIG(w, h, nc, depth, ratio, res, tile, fmt) \
-   { (w), (h), (nc), (depth), 0, (ratio), (res), (tile), Jpeg_Compression_Format_##fmt }
+#define CONFIG(w, h, nc, depth, ratio, res, tile) \
+   { (w), (h), (nc), (depth), 0, (ratio), (res), (tile) }
 
 static const scenario_t scenarios[] = {
-   { "gray8_lossless_tiled",   CONFIG(256, 256, 1, 8, 0, 6, 64, j2k_codestream),  PATTERN_SMOOTH, 0, Jpeg_Result_Code_ok },
-   { "rgb8_lossless_edge_tiles", CONFIG(200, 150, 3, 8, 0, 5, 64, jp2_file),     PATTERN_SMOOTH, 0, Jpeg_Result_Code_ok },
-   { "gray12_lossless_single", CONFIG(128, 128, 1, 12, 0, 6, 0, j2k_codestream),  PATTERN_SMOOTH, 0, Jpeg_Result_Code_ok },
-   { "rgb8_lossy10_single",    CONFIG(256, 256, 3, 8, 10, 6, 0, jp2_file),        PATTERN_SMOOTH, 0, Jpeg_Result_Code_ok },
-   { "gray16_lossy20_tiled",   CONFIG(300, 200, 1, 16, 20, 4, 128, j2k_codestream), PATTERN_SMOOTH, 0, Jpeg_Result_Code_ok },
-   { "err_partial_upload",     CONFIG(256, 256, 1, 8, 0, 6, 64, j2k_codestream),  PATTERN_SMOOTH, 1000, Jpeg_Result_Code_input_size_mismatch },
-   { "err_too_many_levels",    CONFIG(256, 256, 1, 8, 0, 8, 64, j2k_codestream),  PATTERN_SMOOTH, 0, Jpeg_Result_Code_invalid_config },
-   { "err_tile_too_big",       CONFIG(512, 512, 3, 8, 0, 6, 400, j2k_codestream), PATTERN_SMOOTH, 0, Jpeg_Result_Code_invalid_config },
-   { "err_output_overflow",    CONFIG(1024, 1024, 1, 8, 0, 6, 256, j2k_codestream), PATTERN_NOISE, 0, Jpeg_Result_Code_output_overflow },
-   { "err_out_of_memory",      CONFIG(1024, 1024, 1, 8, 0, 6, 0, j2k_codestream), PATTERN_SMOOTH, 0, Jpeg_Result_Code_out_of_memory },
-   { "gray8_after_errors",     CONFIG(256, 256, 1, 8, 0, 6, 64, j2k_codestream),  PATTERN_SMOOTH, 0, Jpeg_Result_Code_ok },
+   { "gray8_lossless_tiled",   CONFIG(256, 256, 1, 8, 0, 6, 64),  PATTERN_SMOOTH, 0, Jpeg_Result_Code_ok },
+   { "rgb8_lossless_edge_tiles", CONFIG(200, 150, 3, 8, 0, 5, 64),     PATTERN_SMOOTH, 0, Jpeg_Result_Code_ok },
+   { "gray12_lossless_single", CONFIG(128, 128, 1, 12, 0, 6, 0),  PATTERN_SMOOTH, 0, Jpeg_Result_Code_ok },
+   { "rgb8_lossy10_single",    CONFIG(256, 256, 3, 8, 10, 6, 0),        PATTERN_SMOOTH, 0, Jpeg_Result_Code_ok },
+   { "gray16_lossy20_tiled",   CONFIG(300, 200, 1, 16, 20, 4, 128), PATTERN_SMOOTH, 0, Jpeg_Result_Code_ok },
+   { "err_partial_upload",     CONFIG(256, 256, 1, 8, 0, 6, 64),  PATTERN_SMOOTH, 1000, Jpeg_Result_Code_input_size_mismatch },
+   { "err_too_many_levels",    CONFIG(256, 256, 1, 8, 0, 8, 64),  PATTERN_SMOOTH, 0, Jpeg_Result_Code_invalid_config },
+   { "rgb8_large_edge_tiles",  CONFIG(384, 384, 3, 8, 0, 6, 256), PATTERN_SMOOTH, 0, Jpeg_Result_Code_ok },
+   { "err_output_overflow",    CONFIG(1024, 1024, 1, 8, 0, 6, 256), PATTERN_NOISE, 0, Jpeg_Result_Code_output_overflow },
+   { "err_out_of_memory",      CONFIG(1024, 1024, 1, 8, 0, 6, 0), PATTERN_SMOOTH, 0, Jpeg_Result_Code_out_of_memory },
+   { "gray8_after_errors",     CONFIG(256, 256, 1, 8, 0, 6, 64),  PATTERN_SMOOTH, 0, Jpeg_Result_Code_ok },
 };
 #define SCENARIO_COUNT (sizeof(scenarios) / sizeof(scenarios[0]))
 
@@ -204,7 +204,7 @@ static void finish_scenario(const scenario_t *s)
    if (result != Jpeg_Result_Code_invalid_offset) {
       fail("read past the end should return invalid-offset");
    }
-   save(s->name, s->config.format == Jpeg_Compression_Format_jp2_file ? "jp2" : "j2k", compressed, offset);
+   save(s->name, "j2k", compressed, offset);
    save(s->name, "raw", image, raw);
 }
 
