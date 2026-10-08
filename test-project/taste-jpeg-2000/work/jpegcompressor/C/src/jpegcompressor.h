@@ -17,25 +17,22 @@ extern "C" {
 void jpegcompressor_startup(void);
 
 /* Provided interfaces */
-void jpegcompressor_PI_clear_buffer( void );
+void jpegcompressor_PI_clear_buffer( asn1SccJpeg_Result_Code * );
 
 
-void jpegcompressor_PI_compression_completed( void );
+void jpegcompressor_PI_read_buffer( const asn1SccJpeg_Read_Request *, asn1SccJpeg_Data_Chunk *, asn1SccJpeg_Result_Code * );
 
 
-void jpegcompressor_PI_read_buffer( void );
+void jpegcompressor_PI_start_compression( const asn1SccJpeg_Compression_Config * );
 
 
-void jpegcompressor_PI_start_compression( void );
+void jpegcompressor_PI_status( asn1SccJpeg_Compressor_Status * );
 
 
-void jpegcompressor_PI_status( void );
-
-
-void jpegcompressor_PI_write_buffer( void );
+void jpegcompressor_PI_write_buffer( const asn1SccJpeg_Write_Request *, asn1SccJpeg_Result_Code * );
 
 /* Required interfaces */
-
+extern void jpegcompressor_RI_compression_completed( const asn1SccJpeg_Compression_Result * );
 
 
 #ifdef __cplusplus

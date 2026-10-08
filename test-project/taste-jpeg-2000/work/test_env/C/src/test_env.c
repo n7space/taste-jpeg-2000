@@ -7,20 +7,245 @@
     !! the procedures corresponding to the provided interfaces in this  !!
     !! file. The up-to-date signatures can be found in the header file. !!
 */
+#include <errno.h>
+#include <string.h>
+#include <sys/stat.h>
 #include "test_env.h"
-//#include <stdio.h>
 
+/*
+ * Test driver for JpegCompressor (host only, uses stdio).
+ * Each trigger runs one step of the current scenario:
+ *   upload the generated image + start_compression, then, once
+ *   compression_completed is received, check the result, download the
+ *   compressed data and save it as test_output/<name>.(j2k|jp2), together
+ *   with the raw image (<name>.raw) for an external comparison.
+ * The process exits when all scenarios are done (exit code = failures).
+ */
+
+#define MAX_IMAGE_SIZE (1024U * 1024U)
+
+typedef enum { PATTERN_SMOOTH, PATTERN_NOISE } pattern_t;
+
+typedef struct {
+   const char *name;
+   asn1SccJpeg_Compression_Config config;
+   pattern_t pattern;
+   unsigned upload_size;   // 0: whole image, otherwise number of bytes uploaded
+   asn1SccJpeg_Result_Code expected;
+} scenario_t;
+
+#define CONFIG(w, h, nc, depth, ratio, res, tile, fmt) \
+   { (w), (h), (nc), (depth), 0, (ratio), (res), (tile), Jpeg_Compression_Format_##fmt }
+
+static const scenario_t scenarios[] = {
+   { "gray8_lossless_tiled",   CONFIG(256, 256, 1, 8, 0, 6, 64, j2k_codestream),  PATTERN_SMOOTH, 0, Jpeg_Result_Code_ok },
+   { "rgb8_lossless_edge_tiles", CONFIG(200, 150, 3, 8, 0, 5, 64, jp2_file),     PATTERN_SMOOTH, 0, Jpeg_Result_Code_ok },
+   { "gray12_lossless_single", CONFIG(128, 128, 1, 12, 0, 6, 0, j2k_codestream),  PATTERN_SMOOTH, 0, Jpeg_Result_Code_ok },
+   { "rgb8_lossy10_single",    CONFIG(256, 256, 3, 8, 10, 6, 0, jp2_file),        PATTERN_SMOOTH, 0, Jpeg_Result_Code_ok },
+   { "gray16_lossy20_tiled",   CONFIG(300, 200, 1, 16, 20, 4, 128, j2k_codestream), PATTERN_SMOOTH, 0, Jpeg_Result_Code_ok },
+   { "err_partial_upload",     CONFIG(256, 256, 1, 8, 0, 6, 64, j2k_codestream),  PATTERN_SMOOTH, 1000, Jpeg_Result_Code_input_size_mismatch },
+   { "err_too_many_levels",    CONFIG(256, 256, 1, 8, 0, 8, 64, j2k_codestream),  PATTERN_SMOOTH, 0, Jpeg_Result_Code_invalid_config },
+   { "err_tile_too_big",       CONFIG(512, 512, 3, 8, 0, 6, 400, j2k_codestream), PATTERN_SMOOTH, 0, Jpeg_Result_Code_invalid_config },
+   { "err_output_overflow",    CONFIG(1024, 1024, 1, 8, 0, 6, 256, j2k_codestream), PATTERN_NOISE, 0, Jpeg_Result_Code_output_overflow },
+   { "err_out_of_memory",      CONFIG(1024, 1024, 1, 8, 0, 6, 0, j2k_codestream), PATTERN_SMOOTH, 0, Jpeg_Result_Code_out_of_memory },
+   { "gray8_after_errors",     CONFIG(256, 256, 1, 8, 0, 6, 64, j2k_codestream),  PATTERN_SMOOTH, 0, Jpeg_Result_Code_ok },
+};
+#define SCENARIO_COUNT (sizeof(scenarios) / sizeof(scenarios[0]))
+
+static unsigned char image[MAX_IMAGE_SIZE];
+static unsigned char compressed[MAX_IMAGE_SIZE];
+
+static unsigned current;
+static int waiting;
+static int completed;
+static asn1SccJpeg_Compression_Result completion;
+static int failures;
+
+static void fail(const char *what)
+{
+   printf("[test_env] FAIL %s: %s\n", scenarios[current].name, what);
+   failures++;
+}
+
+static unsigned image_size(const asn1SccJpeg_Compression_Config *c)
+{
+   return (unsigned)(c->width * c->height * c->num_components * (c->bit_depth <= 8 ? 1 : 2));
+}
+
+static void generate_image(const scenario_t *s)
+{
+   const asn1SccJpeg_Compression_Config *c = &s->config;
+   unsigned bytes = c->bit_depth <= 8 ? 1U : 2U;
+   unsigned max = (1U << c->bit_depth) - 1U;
+   unsigned seed = 12345U;
+   unsigned i = 0;
+   unsigned comp, x, y;
+
+   for (comp = 0; comp < c->num_components; comp++) {
+      for (y = 0; y < c->height; y++) {
+         for (x = 0; x < c->width; x++) {
+            unsigned v;
+            seed ^= seed << 13; // xorshift32
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            if (s->pattern == PATTERN_NOISE) {
+               v = (seed >> 16) & max;
+            } else {
+               v = ((x * 7U + y * 3U + comp * 80U) * (max + 1U) / 1024U + ((seed >> 16) & 3U)) & max;
+            }
+            image[i++] = (unsigned char)(v & 0xFFU);
+            if (bytes == 2U) {
+               image[i++] = (unsigned char)(v >> 8);
+            }
+         }
+      }
+   }
+}
+
+static void save(const char *name, const char *extension, const unsigned char *data, unsigned size)
+{
+   char path[128];
+   FILE *f;
+
+   snprintf(path, sizeof(path), "test_output/%s.%s", name, extension);
+   f = fopen(path, "wb");
+   if (f == NULL) {
+      printf("[test_env] cannot open %s: %s\n", path, strerror(errno));
+      fail("cannot write output file");
+      return;
+   }
+   if (fwrite(data, 1, size, f) != size) {
+      fail("cannot write output file");
+   }
+   fclose(f);
+}
+
+static void start_scenario(const scenario_t *s)
+{
+   asn1SccJpeg_Result_Code result;
+   asn1SccJpeg_Write_Request request;
+   asn1SccJpeg_Read_Request read_request = { 0, 16 };
+   asn1SccJpeg_Data_Chunk chunk;
+   unsigned size = s->upload_size ? s->upload_size : image_size(&s->config);
+   unsigned offset;
+
+   generate_image(s);
+   test_env_RI_clear_buffer(&result);
+   if (result != Jpeg_Result_Code_ok) {
+      fail("clear_buffer");
+   }
+   // Nothing to read after a clear
+   test_env_RI_read_buffer(&read_request, &chunk, &result);
+   if (result != Jpeg_Result_Code_no_output || chunk.nCount != 0) {
+      fail("read_buffer after clear should return no-output");
+   }
+   // Upload in chunks, last chunk first to check out of order writes
+   for (offset = 0; offset < size; offset += sizeof(request.data.arr)) {
+      unsigned first = size - (size - 1U) % (unsigned)sizeof(request.data.arr) - 1U - offset;
+      unsigned length = size - first < sizeof(request.data.arr) ? size - first : (unsigned)sizeof(request.data.arr);
+      request.offset = first;
+      request.data.nCount = (int)length;
+      memcpy(request.data.arr, image + first, length);
+      test_env_RI_write_buffer(&request, &result);
+      if (result != Jpeg_Result_Code_ok) {
+         fail("write_buffer");
+         return;
+      }
+   }
+   waiting = 1;
+   completed = 0;
+   test_env_RI_start_compression(&s->config);
+}
+
+static void finish_scenario(const scenario_t *s)
+{
+   asn1SccJpeg_Compressor_Status status;
+   asn1SccJpeg_Read_Request request;
+   asn1SccJpeg_Data_Chunk chunk;
+   asn1SccJpeg_Result_Code result;
+   unsigned offset = 0;
+   unsigned raw = image_size(&s->config);
+
+   test_env_RI_status(&status);
+   printf("[test_env] %-26s result=%d (expected %d) size=%7u/%7u B  pool peak=%8llu B\n",
+          s->name, (int)completion.result, (int)s->expected, (unsigned)completion.output_size, raw,
+          (unsigned long long)status.memory_peak);
+
+   if (completion.result != s->expected) {
+      fail("unexpected compression result");
+      return;
+   }
+   if (status.last_result != completion.result ||
+       status.state != (s->expected == Jpeg_Result_Code_ok ? Jpeg_Compressor_State_completed
+                                                            : Jpeg_Compressor_State_failed)) {
+      fail("status does not match the completion");
+   }
+   if (s->expected != Jpeg_Result_Code_ok) {
+      return;
+   }
+   // Download with odd sized requests to exercise partial chunks
+   do {
+      request.offset = offset;
+      request.length = 1000;
+      test_env_RI_read_buffer(&request, &chunk, &result);
+      if (result != Jpeg_Result_Code_ok) {
+         fail("read_buffer");
+         return;
+      }
+      memcpy(compressed + offset, chunk.arr, (size_t)chunk.nCount);
+      offset += (unsigned)chunk.nCount;
+   } while (chunk.nCount > 0);
+
+   if (offset != completion.output_size || offset != status.output_size) {
+      fail("downloaded size mismatch");
+   }
+   request.offset = offset + 1U;
+   test_env_RI_read_buffer(&request, &chunk, &result);
+   if (result != Jpeg_Result_Code_invalid_offset) {
+      fail("read past the end should return invalid-offset");
+   }
+   save(s->name, s->config.format == Jpeg_Compression_Format_jp2_file ? "jp2" : "j2k", compressed, offset);
+   save(s->name, "raw", image, raw);
+}
 
 void test_env_startup(void)
 {
    // Write your initialisation code
    // You may call sporadic required interfaces and start timers
    // puts ("[test_env] Startup");
+   current = 0;
+   waiting = 0;
+   failures = 0;
+   // Output files go to test_output/ in the current working directory
+   if (mkdir("test_output", 0755) != 0 && errno != EEXIST) {
+      printf("[test_env] cannot create test_output/: %s\n", strerror(errno));
+   }
 }
 
-void test_env_PI_trigger(void)
+void test_env_PI_compression_completed( const asn1SccJpeg_Compression_Result *IN_result )
 {
-   // Write your code here
+   completion = *IN_result;
+   completed = 1;
 }
 
 
+void test_env_PI_trigger( void )
+{
+   if (current >= SCENARIO_COUNT) {
+      return;
+   }
+   if (waiting) {
+      if (!completed) {
+         return;
+      }
+      waiting = 0;
+      finish_scenario(&scenarios[current]);
+      current++;
+      if (current == SCENARIO_COUNT) {
+         printf("[test_env] %u scenarios, %d failure(s)\n", (unsigned)SCENARIO_COUNT, failures);
+         fflush(stdout);
+         _Exit(failures); // exit() would wait for the TASTE runtime threads
+      }
+   }
+   start_scenario(&scenarios[current]);
+}

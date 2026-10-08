@@ -87,6 +87,7 @@ static opj_mem_block_t *opj_mem_free_list = NULL;
 static OPJ_BOOL opj_mem_initialized = OPJ_FALSE;
 static size_t opj_mem_used = 0U;
 static size_t opj_mem_peak = 0U;
+static size_t opj_mem_failures = 0U;
 
 static INLINE size_t opj_mem_size(const opj_mem_block_t *b)
 {
@@ -232,7 +233,7 @@ static INLINE size_t opj_mem_block_size(size_t size)
 static void *opj_mem_alloc(size_t alignment, size_t size)
 {
     opj_mem_block_t *b;
-    size_t block_size;
+    size_t needed_block_size;
     size_t gap = 0U;
 
     /* alignment shall be power of 2 */
@@ -241,8 +242,9 @@ static void *opj_mem_alloc(size_t alignment, size_t size)
     if ((size == 0U) || !opj_mem_initialized) {
         return NULL;
     }
-    block_size = opj_mem_block_size(size);
-    if (block_size == 0U) {
+    needed_block_size = opj_mem_block_size(size);
+    if (needed_block_size == 0U) {
+        opj_mem_failures++;
         return NULL;
     }
 
@@ -260,11 +262,12 @@ static void *opj_mem_alloc(size_t alignment, size_t size)
                 gap += alignment;
             }
         }
-        if ((b_size >= gap) && (b_size - gap >= block_size)) {
+        if ((b_size >= gap) && (b_size - gap >= needed_block_size)) {
             break;
         }
     }
     if (b == NULL) {
+        opj_mem_failures++;
         return NULL;
     }
 
@@ -279,7 +282,7 @@ static void *opj_mem_alloc(size_t alignment, size_t size)
         opj_mem_list_remove(b);
         opj_mem_set(b, opj_mem_size(b), OPJ_MEM_USED);
     }
-    opj_mem_shrink(b, block_size);
+    opj_mem_shrink(b, needed_block_size);
     opj_mem_account(0U, opj_mem_size(b));
 
     return opj_mem_payload(b);
@@ -291,6 +294,8 @@ static void *opj_mem_realloc(void *ptr, size_t alignment, size_t new_size)
     opj_mem_block_t *next;
     size_t block_size;
     size_t old_size;
+    size_t copy_size;
+    OPJ_BOOL in_place;
     void *new_ptr;
 
     if (new_size == 0U) { /* prevent implementation defined behavior of realloc */
@@ -301,6 +306,7 @@ static void *opj_mem_realloc(void *ptr, size_t alignment, size_t new_size)
     }
     block_size = opj_mem_block_size(new_size);
     if (block_size == 0U) {
+        opj_mem_failures++;
         return NULL;
     }
 
@@ -308,14 +314,16 @@ static void *opj_mem_realloc(void *ptr, size_t alignment, size_t new_size)
     assert(opj_mem_is_used(b));
     old_size = opj_mem_size(b);
 
-    /* resize in place (keeps alignment): shrink, or grow into next free block */
+    /* resize in place (keeps the pointer): shrink, or grow into next free
+     * block, unless ptr does not satisfy the requested alignment */
+    in_place = ((size_t)ptr & (alignment - 1U)) == 0U;
     next = opj_mem_next(b);
-    if (block_size <= old_size) {
+    if (in_place && (block_size <= old_size)) {
         opj_mem_shrink(b, block_size);
         opj_mem_account(old_size, opj_mem_size(b));
         return ptr;
     }
-    if (!opj_mem_is_used(next) &&
+    if (in_place && !opj_mem_is_used(next) &&
             (old_size + opj_mem_size(next) >= block_size)) {
         opj_mem_list_remove(next);
         opj_mem_set(b, old_size + opj_mem_size(next), OPJ_MEM_USED);
@@ -329,7 +337,11 @@ static void *opj_mem_realloc(void *ptr, size_t alignment, size_t new_size)
     if (new_ptr == NULL) {
         return NULL;
     }
-    memcpy(new_ptr, ptr, old_size - OPJ_MEM_HDR_SIZE);
+    copy_size = old_size - OPJ_MEM_HDR_SIZE;
+    if (copy_size > new_size) {
+        copy_size = new_size;
+    }
+    memcpy(new_ptr, ptr, copy_size);
     opj_free(ptr);
     return new_ptr;
 }
@@ -345,6 +357,7 @@ OPJ_BOOL OPJ_CALLCONV opj_mem_pool_init(void *buffer, OPJ_SIZE_T size)
     opj_mem_free_list = NULL;
     opj_mem_used = 0U;
     opj_mem_peak = 0U;
+    opj_mem_failures = 0U;
 
     if (buffer == NULL) {
         return OPJ_FALSE;
@@ -379,6 +392,11 @@ OPJ_SIZE_T OPJ_CALLCONV opj_mem_pool_get_used(void)
 OPJ_SIZE_T OPJ_CALLCONV opj_mem_pool_get_peak(void)
 {
     return opj_mem_peak;
+}
+
+OPJ_SIZE_T OPJ_CALLCONV opj_mem_pool_get_failures(void)
+{
+    return opj_mem_failures;
 }
 
 void * opj_malloc(size_t size)

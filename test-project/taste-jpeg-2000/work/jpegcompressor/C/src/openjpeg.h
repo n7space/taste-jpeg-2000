@@ -1194,6 +1194,13 @@ OPJ_API OPJ_SIZE_T OPJ_CALLCONV opj_mem_pool_get_used(void);
 */
 OPJ_API OPJ_SIZE_T OPJ_CALLCONV opj_mem_pool_get_peak(void);
 
+/**
+ * @return  number of allocations that failed because the pool was exhausted
+ *          since opj_mem_pool_init(), to tell an undersized pool from other
+ *          encoder errors.
+*/
+OPJ_API OPJ_SIZE_T OPJ_CALLCONV opj_mem_pool_get_failures(void);
+
 /*
 ==========================================================
    stream functions definitions
