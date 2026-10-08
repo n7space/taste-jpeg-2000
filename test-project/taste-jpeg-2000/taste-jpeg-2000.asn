@@ -9,6 +9,8 @@ BEGIN
    Jpeg-Buffer-Size ::= INTEGER (0 .. 16777216)
 
    -- Raw image upload: data is copied to the input buffer at offset.
+   -- offset must not be past the data already uploaded (no gaps: chunks may
+   -- be re-sent, not skipped); use clear-buffer before uploading a new image.
    -- Image layout: planar (all samples of component 0, then component 1, ...),
    -- each component row by row; 1 byte per sample for bit-depth <= 8,
    -- otherwise 2 bytes per sample, little endian
@@ -62,7 +64,7 @@ BEGIN
    Jpeg-Compressor-Status ::= SEQUENCE {
       state          Jpeg-Compressor-State,
       last-result    Jpeg-Result-Code,
-      input-size     Jpeg-Buffer-Size,   -- bytes uploaded (highest written offset)
+      input-size     Jpeg-Buffer-Size,   -- bytes uploaded contiguously from offset 0
       output-size    Jpeg-Buffer-Size,   -- compressed bytes available
       memory-peak    INTEGER (0 .. 4294967295)  -- encoder pool peak usage in bytes
    }

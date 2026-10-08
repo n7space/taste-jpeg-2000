@@ -36,9 +36,12 @@ typedef struct {
 
 #define CONFIG(w, h, nc, depth, ratio, res, tile) \
    { (w), (h), (nc), (depth), 0, (ratio), (res), (tile) }
+#define SIGNED_CONFIG(w, h, nc, depth, ratio, res, tile) \
+   { (w), (h), (nc), (depth), 1, (ratio), (res), (tile) }
 
 static const scenario_t scenarios[] = {
    { "gray8_lossless_tiled",   CONFIG(256, 256, 1, 8, 0, 6, 64),  PATTERN_SMOOTH, 0, Jpeg_Result_Code_ok },
+   { "gray8_signed_lossless",  SIGNED_CONFIG(128, 128, 1, 8, 0, 5, 64), PATTERN_SMOOTH, 0, Jpeg_Result_Code_ok },
    { "rgb8_lossless_edge_tiles", CONFIG(200, 150, 3, 8, 0, 5, 64),     PATTERN_SMOOTH, 0, Jpeg_Result_Code_ok },
    { "gray12_lossless_single", CONFIG(128, 128, 1, 12, 0, 6, 0),  PATTERN_SMOOTH, 0, Jpeg_Result_Code_ok },
    { "rgb8_lossy10_single",    CONFIG(256, 256, 3, 8, 10, 6, 0),        PATTERN_SMOOTH, 0, Jpeg_Result_Code_ok },
@@ -120,7 +123,19 @@ static void save(const char *name, const char *extension, const unsigned char *d
    fclose(f);
 }
 
-static void start_scenario(const scenario_t *s)
+static void upload(asn1SccJpeg_Write_Request *request, unsigned offset, unsigned size,
+                   asn1SccJpeg_Result_Code *result)
+{
+   unsigned length = size - offset < sizeof(request->data.arr) ? size - offset
+                                                               : (unsigned)sizeof(request->data.arr);
+   request->offset = offset;
+   request->data.nCount = (int)length;
+   memcpy(request->data.arr, image + offset, length);
+   test_env_RI_write_buffer(request, result);
+}
+
+// Returns 1 when the compression was started, 0 if the scenario failed before
+static int start_scenario(const scenario_t *s)
 {
    asn1SccJpeg_Result_Code result;
    asn1SccJpeg_Write_Request request;
@@ -129,6 +144,10 @@ static void start_scenario(const scenario_t *s)
    unsigned size = s->upload_size ? s->upload_size : image_size(&s->config);
    unsigned offset;
 
+   if (image_size(&s->config) > MAX_IMAGE_SIZE) {
+      fail("image larger than the test buffer");
+      return 0;
+   }
    generate_image(s);
    test_env_RI_clear_buffer(&result);
    if (result != Jpeg_Result_Code_ok) {
@@ -139,22 +158,28 @@ static void start_scenario(const scenario_t *s)
    if (result != Jpeg_Result_Code_no_output || chunk.nCount != 0) {
       fail("read_buffer after clear should return no-output");
    }
-   // Upload in chunks, last chunk first to check out of order writes
+   // A chunk leaving a gap must be refused
+   if (size > sizeof(request.data.arr)) {
+      upload(&request, (unsigned)sizeof(request.data.arr), size, &result);
+      if (result != Jpeg_Result_Code_invalid_offset) {
+         fail("write_buffer leaving a gap should return invalid-offset");
+      }
+   }
+   // Upload in order, re-sending the first chunk once (retransmission)
    for (offset = 0; offset < size; offset += sizeof(request.data.arr)) {
-      unsigned first = size - (size - 1U) % (unsigned)sizeof(request.data.arr) - 1U - offset;
-      unsigned length = size - first < sizeof(request.data.arr) ? size - first : (unsigned)sizeof(request.data.arr);
-      request.offset = first;
-      request.data.nCount = (int)length;
-      memcpy(request.data.arr, image + first, length);
-      test_env_RI_write_buffer(&request, &result);
+      upload(&request, offset, size, &result);
+      if (result == Jpeg_Result_Code_ok && offset == sizeof(request.data.arr)) {
+         upload(&request, 0, size, &result);
+      }
       if (result != Jpeg_Result_Code_ok) {
          fail("write_buffer");
-         return;
+         return 0;
       }
    }
    waiting = 1;
    completed = 0;
    test_env_RI_start_compression(&s->config);
+   return 1;
 }
 
 static void finish_scenario(const scenario_t *s)
@@ -231,21 +256,21 @@ void test_env_PI_compression_completed( const asn1SccJpeg_Compression_Result *IN
 
 void test_env_PI_trigger( void )
 {
-   if (current >= SCENARIO_COUNT) {
-      return;
-   }
-   if (waiting) {
-      if (!completed) {
-         return;
-      }
-      waiting = 0;
-      finish_scenario(&scenarios[current]);
-      current++;
-      if (current == SCENARIO_COUNT) {
-         printf("[test_env] %u scenarios, %d failure(s)\n", (unsigned)SCENARIO_COUNT, failures);
-         fflush(stdout);
-         _Exit(failures); // exit() would wait for the TASTE runtime threads
+   while (current < SCENARIO_COUNT) {
+      if (waiting) {
+         if (!completed) {
+            return;
+         }
+         waiting = 0;
+         finish_scenario(&scenarios[current]);
+         current++;
+      } else if (start_scenario(&scenarios[current])) {
+         return; // wait for compression_completed
+      } else {
+         current++; // could not start, failure already counted
       }
    }
-   start_scenario(&scenarios[current]);
+   printf("[test_env] %u scenarios, %d failure(s)\n", (unsigned)SCENARIO_COUNT, failures);
+   fflush(stdout);
+   _Exit(failures); // exit() would wait for the TASTE runtime threads
 }

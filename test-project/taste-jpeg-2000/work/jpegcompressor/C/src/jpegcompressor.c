@@ -16,7 +16,9 @@
  * JPEG 2000 compressor based on OpenJPEG, without dynamic memory allocation.
  *
  * Usage:
- *   1. write_buffer: upload the raw image in chunks (any order, any offset).
+ *   1. write_buffer: upload the raw image in chunks. A chunk must start at
+ *      most at the end of the data already uploaded (no gaps), so chunks can
+ *      be re-sent but not skipped. Call clear_buffer before a new image.
  *      Layout: planar (all samples of component 0, then component 1, ...),
  *      each component row by row; 1 byte per sample for bit-depth <= 8,
  *      otherwise 2 bytes per sample, little endian.
@@ -69,7 +71,7 @@ static opj_cparameters_t encoder_parameters;
 static struct {
    asn1SccJpeg_Compressor_State state;
    asn1SccJpeg_Result_Code last_result;
-   OPJ_SIZE_T input_size;       // highest uploaded byte + 1
+   OPJ_SIZE_T input_size;       // bytes uploaded contiguously from offset 0
    OPJ_SIZE_T output_size;      // compressed bytes available
    OPJ_BOOL output_overflow;    // the compressed data did not fit
 } compressor;
@@ -133,6 +135,10 @@ static asn1SccJpeg_Result_Code check_config(const asn1SccJpeg_Compression_Config
    geometry->tiles_y = (geometry->height + geometry->tile_height - 1U) / geometry->tile_height;
 
    if (geometry->image_size > JPEGCOMPRESSOR_INPUT_BUFFER_SIZE) {
+      return Jpeg_Result_Code_invalid_config;
+   }
+   // JPEG 2000 limits the number of tiles to 65535
+   if (geometry->tiles_x * geometry->tiles_y > 65535U) {
       return Jpeg_Result_Code_invalid_config;
    }
    // OpenJPEG requires tiles of at least 2^(resolutions - 1) pixels
@@ -420,7 +426,9 @@ void jpegcompressor_PI_write_buffer( const asn1SccJpeg_Write_Request *IN_request
       return;
    }
    length = (OPJ_SIZE_T)IN_request->data.nCount;
-   if ((IN_request->offset > JPEGCOMPRESSOR_INPUT_BUFFER_SIZE) ||
+   // No gaps: the chunk must start inside or right after the uploaded data,
+   // so that input_size bytes are always actually uploaded
+   if ((IN_request->offset > compressor.input_size) ||
        (length > JPEGCOMPRESSOR_INPUT_BUFFER_SIZE - offset)) {
       *OUT_result = Jpeg_Result_Code_invalid_offset;
       return;

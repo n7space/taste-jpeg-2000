@@ -2719,7 +2719,9 @@ OPJ_BOOL opj_tcd_copy_tile_data(opj_tcd_t *p_tcd,
 
         switch (l_size_comp) {
         case 1: {
-            OPJ_CHAR * l_src_ptr = (OPJ_CHAR *) p_src;
+            /* OPJ_INT8, not OPJ_CHAR: char is unsigned on ARM, which would
+             * turn negative signed samples into large positive values */
+            OPJ_INT8 * l_src_ptr = (OPJ_INT8 *) p_src;
             OPJ_INT32 * l_dest_ptr = l_tilec->data;
 
             if (l_img_comp->sgnd) {
