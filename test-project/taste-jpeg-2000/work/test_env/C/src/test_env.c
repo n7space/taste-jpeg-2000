@@ -13,13 +13,14 @@
 #include "test_env.h"
 
 /*
- * Test driver for JpegCompressor (host only, uses stdio).
- * Each trigger runs one step of the current scenario:
- *   upload the generated image + start_compression, then, once
- *   compression_completed is received, check the result, download the
- *   compressed data and save it as test_output/<name>.j2k, together
- *   with the raw image (<name>.raw) for an external comparison.
- * The process exits when all scenarios are done (exit code = failures).
+ * Test driver for JpegCompressor (Linux only, uses stdio and files).
+ * Scenarios run one after the other: a scenario uploads its generated image
+ * and calls start_compression; the next trigger after compression_completed
+ * checks the result, downloads the compressed data, saves it as
+ * test_output/<name>.j2k (with the raw image in <name>.raw, for an external
+ * comparison) and starts the next scenario.
+ * Failures are printed; when all scenarios are done the process exits with
+ * the number of failures as exit code.
  */
 
 #define MAX_IMAGE_SIZE (1024U * 1024U)
@@ -208,7 +209,8 @@ static void finish_scenario(const scenario_t *s)
    if (s->expected != Jpeg_Result_Code_ok) {
       return;
    }
-   // Download with odd sized requests to exercise partial chunks
+   // Download in 1000-byte requests (not a multiple of the 1024-byte chunk)
+   // to exercise partial chunks
    do {
       request.offset = offset;
       request.length = 1000;
@@ -235,9 +237,6 @@ static void finish_scenario(const scenario_t *s)
 
 void test_env_startup(void)
 {
-   // Write your initialisation code
-   // You may call sporadic required interfaces and start timers
-   // puts ("[test_env] Startup");
    current = 0;
    waiting = 0;
    failures = 0;
@@ -272,5 +271,5 @@ void test_env_PI_trigger( void )
    }
    printf("[test_env] %u scenarios, %d failure(s)\n", (unsigned)SCENARIO_COUNT, failures);
    fflush(stdout);
-   _Exit(failures); // exit() would wait for the TASTE runtime threads
+   _Exit(failures); // not exit(): it hangs in the TASTE runtime (observed on Linux)
 }

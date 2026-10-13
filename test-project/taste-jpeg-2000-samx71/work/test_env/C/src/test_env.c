@@ -20,8 +20,10 @@
  * but the TASTE runtime (SamV71Core_Init, called by the Init task) raises the
  * clock to 300 MHz core / 150 MHz MCK without programming the flash wait
  * states, as it normally runs the code from SRAM. At 150 MHz the flash needs
- * 7 access cycles (FWS = 6): set them during the RTEMS system initialization,
- * while the chip still runs on its reset clock.
+ * 7 access cycles (FWS = 6, SAMV71 datasheet): set them at the start of the
+ * RTEMS system initialization, while the chip still runs on its reset clock.
+ * This is in test_env.c because a source file containing only this hook
+ * would not be linked: nothing references it.
  */
 #define EEFC_FMR (*(volatile uint32_t *)0x400E0C00U)   // EEFC Flash Mode Register
 #define EEFC_FMR_FWS_SHIFT 8U
@@ -42,12 +44,15 @@ RTEMS_SYSINIT_ITEM(set_flash_wait_states, RTEMS_SYSINIT_BSP_EARLY, RTEMS_SYSINIT
  * console output: the results are kept in test_results[] and the counters
  * below, to be read with the debugger once test_finished is set.
  *
- * Each trigger runs one step of the current scenario: upload the generated
- * 64x64 image + start_compression, then, once compression_completed is
- * received, check the result and download the compressed data.
- * The CRC-32 of each lossless codestream is checked against the value
- * obtained with the same scenario on Linux (lossless coding is exact
- * integer arithmetic, the codestreams must be identical).
+ * Scenarios run one after the other: a scenario uploads its generated 64x64
+ * image and calls start_compression; the next trigger after
+ * compression_completed checks the result, downloads the compressed data
+ * and starts the next scenario.
+ * The CRC-32 of each lossless codestream is compared with expected_crc32,
+ * obtained by running the same scenario on Linux (the lossless codestreams
+ * are identical on the boards, verified on SAMRH71). These references must
+ * be updated when the compressor, its configuration or the test images
+ * change.
  */
 
 #define IMAGE_SIZE 64U
@@ -61,7 +66,7 @@ typedef struct {
    pattern_t pattern;
    unsigned upload_size;            // 0: whole image, otherwise number of bytes uploaded
    asn1SccJpeg_Result_Code expected;
-   unsigned long expected_crc32;    // reference codestream CRC-32, 0: not checked (lossy)
+   unsigned long expected_crc32;    // reference codestream CRC-32, 0: not checked (lossy, errors)
 } scenario_t;
 
 typedef struct {
@@ -98,7 +103,8 @@ volatile int test_finished;
 
 static unsigned char image[MAX_IMAGE_SIZE];
 
-// Interface parameters are ~1 KB each: kept static, off the thread stacks
+// Interface parameters, kept static to keep them off the small thread stacks
+// (the write request and the data chunk are ~1 KB each)
 static asn1SccJpeg_Write_Request write_request;
 static asn1SccJpeg_Read_Request read_request;
 static asn1SccJpeg_Data_Chunk chunk;
@@ -250,7 +256,8 @@ static void finish_scenario(const scenario_t *s)
    if (s->expected != Jpeg_Result_Code_ok) {
       return;
    }
-   // Download with odd sized requests to exercise partial chunks
+   // Download in 1000-byte requests (not a multiple of the 1024-byte chunk)
+   // to exercise partial chunks
    do {
       read_request.offset = offset;
       read_request.length = 1000;
@@ -279,8 +286,6 @@ static void finish_scenario(const scenario_t *s)
 
 void test_env_startup(void)
 {
-   // Write your initialisation code
-   // You may call sporadic required interfaces and start timers
    current = 0;
    waiting = 0;
    test_scenarios_done = 0;
