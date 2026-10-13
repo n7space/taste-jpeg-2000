@@ -1,0 +1,34 @@
+/*
+ * SAMV71 linker script: code and read-only data in the internal flash,
+ * data, bss, RTEMS work area and stacks in the internal SRAM.
+ *
+ * Same as the TASTE default (TASTE-SAMX-RTEMS-Runtime/linker_script/
+ * linkcmds.intsram) except that it does not load the code into the SRAM:
+ * the 384 KB SRAM is too small for both the code (~185 KB with OpenJPEG)
+ * and the JpegCompressor buffers. The included files come from the TASTE
+ * runtime linker script directory, which stays on the linker search path.
+ * The application must be programmed into the flash (not loaded to RAM).
+ */
+INCLUDE linkcmds.memory
+
+REGION_ALIAS ("REGION_START", INTFLASH);
+REGION_ALIAS ("REGION_VECTOR", INTSRAM);
+REGION_ALIAS ("REGION_TEXT", INTFLASH);
+REGION_ALIAS ("REGION_TEXT_LOAD", INTFLASH);
+REGION_ALIAS ("REGION_RODATA", INTFLASH);
+REGION_ALIAS ("REGION_RODATA_LOAD", INTFLASH);
+REGION_ALIAS ("REGION_DATA", INTSRAM);
+REGION_ALIAS ("REGION_DATA_LOAD", INTFLASH);
+REGION_ALIAS ("REGION_FAST_TEXT", ITCM);
+REGION_ALIAS ("REGION_FAST_TEXT_LOAD", INTFLASH);
+REGION_ALIAS ("REGION_FAST_DATA", DTCM);
+REGION_ALIAS ("REGION_FAST_DATA_LOAD", INTFLASH);
+REGION_ALIAS ("REGION_BSS", INTSRAM);
+REGION_ALIAS ("REGION_WORK", INTSRAM);
+REGION_ALIAS ("REGION_STACK", INTSRAM);
+REGION_ALIAS ("REGION_NOCACHE", NOCACHE);
+REGION_ALIAS ("REGION_NOCACHE_LOAD", INTFLASH);
+
+DEATH_REPORT_BEGIN = 0x2045FAC8;
+
+INCLUDE linkcmds.armv7m
