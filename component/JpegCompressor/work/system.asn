@@ -1,0 +1,9 @@
+-- Dummy dataview to make the PID type visible at system level
+--  DO NOT EDIT - this file will be overwritten during the build
+System-Dataview DEFINITIONS ::=
+BEGIN
+
+   PID-Range ::= INTEGER (0..1)
+   PID ::= ENUMERATED { env }
+END
+

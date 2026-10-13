@@ -1,0 +1,77 @@
+TASTE-JPEG-2000-DATAVIEW DEFINITIONS ::=
+BEGIN
+
+   -- Chunk of raw image data (write_buffer) or of compressed data (read_buffer)
+   Jpeg-Data-Chunk ::= OCTET STRING (SIZE (0 .. 1024))
+
+   -- Byte offset / size inside the compressor input or output buffer.
+   -- The actual buffer sizes are set at build time in jpegcompressor.c
+   Jpeg-Buffer-Size ::= INTEGER (0 .. 16777216)
+
+   -- Raw image upload: data is copied to the input buffer at offset.
+   -- offset must not be past the data already uploaded (no gaps: chunks may
+   -- be re-sent, not skipped); use clear-buffer before uploading a new image.
+   -- Image layout: planar (all samples of component 0, then component 1, ...),
+   -- each component row by row; 1 byte per sample for bit-depth <= 8,
+   -- otherwise 2 bytes per sample, little endian
+   Jpeg-Write-Request ::= SEQUENCE {
+      offset   Jpeg-Buffer-Size,
+      data     Jpeg-Data-Chunk
+   }
+
+   -- Compressed data download: up to length bytes from offset
+   Jpeg-Read-Request ::= SEQUENCE {
+      offset   Jpeg-Buffer-Size,
+      length   INTEGER (0 .. 1024)
+   }
+
+   -- The output is a raw JPEG 2000 codestream (.j2k)
+   Jpeg-Compression-Config ::= SEQUENCE {
+      width              INTEGER (1 .. 8192),
+      height             INTEGER (1 .. 8192),
+      num-components     INTEGER (1 .. 4),
+      bit-depth          INTEGER (1 .. 16),
+      is-signed          BOOLEAN,
+      -- 0 or 1: lossless (reversible 5/3 wavelet),
+      -- N > 1: lossy (irreversible 9/7 wavelet) with target ratio N:1
+      compression-ratio  INTEGER (0 .. 1000),
+      -- number of wavelet resolution levels (OpenJPEG default: 6)
+      resolutions        INTEGER (1 .. 10),
+      -- tile width and height in pixels, 0: whole image as a single tile.
+      -- Tiling reduces the memory needed by the encoder
+      tile-size          INTEGER (0 .. 8192)
+   }
+
+   Jpeg-Result-Code ::= ENUMERATED {
+      ok,
+      busy,                 -- compression in progress
+      invalid-offset,       -- offset/length outside of the buffer
+      invalid-config,       -- inconsistent configuration or not supported
+      input-size-mismatch,  -- uploaded data size does not match the configuration
+      no-output,            -- no compressed data available
+      out-of-memory,        -- encoder memory pool too small
+      output-overflow,      -- compressed data does not fit the output buffer
+      codec-error           -- encoder failure
+   }
+
+   Jpeg-Compressor-State ::= ENUMERATED {
+      idle,          -- no compressed data available
+      compressing,
+      completed,     -- compressed data can be read
+      failed         -- last compression failed, see last-result
+   }
+
+   Jpeg-Compressor-Status ::= SEQUENCE {
+      state          Jpeg-Compressor-State,
+      last-result    Jpeg-Result-Code,
+      input-size     Jpeg-Buffer-Size,   -- bytes uploaded contiguously from offset 0
+      output-size    Jpeg-Buffer-Size,   -- compressed bytes available
+      memory-peak    INTEGER (0 .. 4294967295)  -- encoder pool peak usage in bytes
+   }
+
+   Jpeg-Compression-Result ::= SEQUENCE {
+      result         Jpeg-Result-Code,
+      output-size    Jpeg-Buffer-Size
+   }
+
+END

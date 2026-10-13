@@ -1,0 +1,54 @@
+<InterfaceView version="1.2" componentURL="/home/taste/.local/share/QtProject/QtCreator/components_library/.git_bares/JpegCompressor_bare">
+<Function id="{9f492f27-632e-4421-a9e0-efda203558af}" name="JpegCompressor" is_type="NO" language="C" default_implementation="default" fixed_system_element="NO" required_system_element="NO" instances_min="1" instances_max="1" startup_priority="1">
+    <Property name="TASTE_IV_Properties::Default_Codegen" value="Ada"/>
+<Provided_Interface id="{aa105494-81c9-4fed-84fc-04a53565d58a}" name="start_compression" kind="Sporadic" enable_multicast="true" layer="default" required_system_element="NO" is_simulink_interface="false" priority="1" stack_size="16384" miat="0" wcet="0" queue_size="1">
+    <Input_Parameter name="config" type="Jpeg-Compression-Config" encoding="NATIVE"/>
+</Provided_Interface>
+
+<Provided_Interface id="{64d25bab-c8c5-475d-b57e-02fa875f2912}" name="clear_buffer" kind="Protected" enable_multicast="true" layer="default" required_system_element="NO" is_simulink_interface="false" wcet="0">
+    <Output_Parameter name="result" type="Jpeg-Result-Code" encoding="NATIVE"/>
+</Provided_Interface>
+
+<Provided_Interface id="{08d07bc4-26cb-4abd-99cc-756c42ff0125}" name="write_buffer" kind="Protected" enable_multicast="true" layer="default" required_system_element="NO" is_simulink_interface="false" wcet="0">
+    <Input_Parameter name="request" type="Jpeg-Write-Request" encoding="NATIVE"/>
+    <Output_Parameter name="result" type="Jpeg-Result-Code" encoding="NATIVE"/>
+</Provided_Interface>
+
+<Provided_Interface id="{ab041c43-8dbb-42ff-a072-e2e963a6d248}" name="read_buffer" kind="Protected" enable_multicast="true" layer="default" required_system_element="NO" is_simulink_interface="false" wcet="0">
+    <Input_Parameter name="request" type="Jpeg-Read-Request" encoding="NATIVE"/>
+    <Output_Parameter name="IfaceParam" type="Jpeg-Data-Chunk" encoding="NATIVE"/>
+    <Output_Parameter name="result" type="Jpeg-Result-Code" encoding="NATIVE"/>
+</Provided_Interface>
+
+<Provided_Interface id="{16ffbae9-a12b-4b63-9ac5-407c9c532848}" name="status" kind="Protected" enable_multicast="true" layer="default" required_system_element="NO" is_simulink_interface="false" wcet="0">
+    <Output_Parameter name="status" type="Jpeg-Compressor-Status" encoding="NATIVE"/>
+</Provided_Interface>
+
+<Required_Interface id="{54a65fad-c1cb-4252-8528-4a1a68ae1ed6}" name="compression_completed" kind="Sporadic" enable_multicast="true" layer="default" required_system_element="NO" is_simulink_interface="false" priority="1" stack_size="1024" miat="0" wcet="0" queue_size="1">
+    <Input_Parameter name="result" type="Jpeg-Compression-Result" encoding="NATIVE"/>
+    <Property name="Taste::InheritPI" value="true"/>
+    <Property name="Taste::Autonamed" value="false"/>
+</Required_Interface>
+
+    <Implementations>
+        <Implementation name="default" language="C"/>
+    </Implementations>
+</Function>
+<UI version="1.0" ><Entity id="{9f492f27-632e-4421-a9e0-efda203558af}"><Taste coordinates="50000 32000 70000 67000">
+</Taste>
+</Entity><Entity id="{aa105494-81c9-4fed-84fc-04a53565d58a}"><Taste coordinates="50000 36000">
+</Taste>
+</Entity><Entity id="{64d25bab-c8c5-475d-b57e-02fa875f2912}"><Taste coordinates="50000 41000">
+</Taste>
+</Entity><Entity id="{08d07bc4-26cb-4abd-99cc-756c42ff0125}"><Taste coordinates="50000 46000">
+</Taste>
+</Entity><Entity id="{ab041c43-8dbb-42ff-a072-e2e963a6d248}"><Taste coordinates="50000 51000">
+</Taste>
+</Entity><Entity id="{16ffbae9-a12b-4b63-9ac5-407c9c532848}"><Taste coordinates="50000 56000">
+</Taste>
+</Entity><Entity id="{54a65fad-c1cb-4252-8528-4a1a68ae1ed6}"><Taste coordinates="50000 61000">
+</Taste>
+</Entity>
+</UI>
+
+</InterfaceView>
