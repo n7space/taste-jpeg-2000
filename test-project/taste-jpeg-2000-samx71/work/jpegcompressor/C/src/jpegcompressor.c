@@ -10,7 +10,6 @@
 #include <string.h>
 #include "jpegcompressor.h"
 #include "openjpeg.h"
-//#include <stdio.h>
 
 /*
  * JPEG 2000 compressor based on OpenJPEG, without dynamic memory allocation.
@@ -74,7 +73,7 @@ static struct {
    OPJ_SIZE_T input_size;       // bytes uploaded contiguously from offset 0
    OPJ_SIZE_T output_size;      // compressed bytes available
    OPJ_BOOL output_overflow;    // the compressed data did not fit
-} compressor;
+} compressor = { Jpeg_Compressor_State_idle, Jpeg_Result_Code_ok, 0U, 0U, OPJ_FALSE };
 
 // Image geometry derived from the configuration
 typedef struct {
@@ -108,11 +107,24 @@ static OPJ_SIZE_T stream_write(void *data, OPJ_SIZE_T size, void *user_data)
 /* Compression                                                             */
 /* ---------------------------------------------------------------------- */
 
+// Each wavelet decomposition level halves the tile size, and a tile coded
+// with N resolutions goes through N - 1 levels: its width and height must be
+// at least 2^(N - 1) pixels so that the lowest resolution keeps at least one
+// pixel. OpenJPEG rejects smaller tiles in opj_start_compress
+// (opj_j2k_encoding_validation), checking the nominal tile size like here,
+// not the size of the partial edge tiles.
+static OPJ_BOOL tile_supports_resolutions(const image_geometry_t *geometry, OPJ_UINT32 resolutions)
+{
+   const OPJ_UINT32 min_tile_size = (geometry->tile_width < geometry->tile_height) ?
+                                    geometry->tile_width : geometry->tile_height;
+
+   return (min_tile_size >= (1U << (resolutions - 1U))) ? OPJ_TRUE : OPJ_FALSE;
+}
+
 static asn1SccJpeg_Result_Code check_config(const asn1SccJpeg_Compression_Config *config,
                                             image_geometry_t *geometry)
 {
-   int error_code;
-   OPJ_UINT32 min_tile_size;
+   int error_code = 0;
 
    if (!asn1SccJpeg_Compression_Config_IsConstraintValid(config, &error_code)) {
       return Jpeg_Result_Code_invalid_config;
@@ -141,10 +153,7 @@ static asn1SccJpeg_Result_Code check_config(const asn1SccJpeg_Compression_Config
    if (geometry->tiles_x * geometry->tiles_y > 65535U) {
       return Jpeg_Result_Code_invalid_config;
    }
-   // OpenJPEG requires tiles of at least 2^(resolutions - 1) pixels
-   min_tile_size = (geometry->tile_width < geometry->tile_height) ?
-                   geometry->tile_width : geometry->tile_height;
-   if (min_tile_size < (1U << (config->resolutions - 1U))) {
+   if (!tile_supports_resolutions(geometry, (OPJ_UINT32)config->resolutions)) {
       return Jpeg_Result_Code_invalid_config;
    }
    if (compressor.input_size != geometry->image_size) {
@@ -177,55 +186,71 @@ static void setup_parameters(const asn1SccJpeg_Compression_Config *config)
    parameters->tcp_mct = (config->num_components >= 3U) ? 1 : 0;
 }
 
-// Copy the samples of one tile from INPUT_BUFFER to tile_buffer, in the
-// layout expected by opj_write_tile (planar, row by row)
-static OPJ_SIZE_T gather_tile(const image_geometry_t *geometry, OPJ_UINT32 tile_x, OPJ_UINT32 tile_y,
-                              OPJ_UINT8 *tile_buffer)
+// Copy the samples of one tile from INPUT_BUFFER to tile_buffer (of
+// tile_buffer_size bytes), in the layout expected by opj_write_tile (planar,
+// row by row), and give the number of bytes copied in tile_size.
+// Returns OPJ_FALSE, without copying anything, if the tile is outside the
+// image or if its data would not fit in INPUT_BUFFER or tile_buffer.
+static OPJ_BOOL gather_tile(const image_geometry_t *geometry, OPJ_UINT32 tile_x, OPJ_UINT32 tile_y,
+                            OPJ_UINT8 *tile_buffer, OPJ_SIZE_T tile_buffer_size, OPJ_SIZE_T *tile_size)
 {
-   OPJ_UINT32 x0 = tile_x * geometry->tile_width;
-   OPJ_UINT32 y0 = tile_y * geometry->tile_height;
+   const OPJ_UINT32 x0 = tile_x * geometry->tile_width;
+   const OPJ_UINT32 y0 = tile_y * geometry->tile_height;
+
+   *tile_size = 0U;
+   if ((x0 >= geometry->width) || (y0 >= geometry->height)) {
+      return OPJ_FALSE;
+   }
+
+   // Edge tiles are cut at the image border
    OPJ_UINT32 width = geometry->width - x0;
    OPJ_UINT32 height = geometry->height - y0;
-   OPJ_SIZE_T line_size = (OPJ_SIZE_T)geometry->width * geometry->bytes_per_sample;
-   OPJ_SIZE_T plane_size = line_size * geometry->height;
-   OPJ_SIZE_T row_size;
-   OPJ_UINT8 *destination = tile_buffer;
-   OPJ_UINT32 component;
-   OPJ_UINT32 row;
-
    if (width > geometry->tile_width) {
       width = geometry->tile_width;
    }
    if (height > geometry->tile_height) {
       height = geometry->tile_height;
    }
-   row_size = (OPJ_SIZE_T)width * geometry->bytes_per_sample;
+   const OPJ_SIZE_T line_size = (OPJ_SIZE_T)geometry->width * geometry->bytes_per_sample;
+   const OPJ_SIZE_T plane_size = line_size * geometry->height;
+   const OPJ_SIZE_T row_size = (OPJ_SIZE_T)width * geometry->bytes_per_sample;
+   const OPJ_SIZE_T copy_size = row_size * height * geometry->num_components;
+   // End of the last row read: last row of the tile in the last component
+   const OPJ_SIZE_T source_end = (OPJ_SIZE_T)(geometry->num_components - 1U) * plane_size +
+                                 (OPJ_SIZE_T)(y0 + height - 1U) * line_size +
+                                 (OPJ_SIZE_T)x0 * geometry->bytes_per_sample + row_size;
 
-   for (component = 0U; component < geometry->num_components; component++) {
+   if ((copy_size > tile_buffer_size) || (source_end > JPEGCOMPRESSOR_INPUT_BUFFER_SIZE)) {
+      return OPJ_FALSE;
+   }
+
+   OPJ_UINT8 *destination = tile_buffer;
+   for (OPJ_UINT32 component = 0U; component < geometry->num_components; component++) {
       const OPJ_UINT8 *source = INPUT_BUFFER + component * plane_size +
                                 y0 * line_size + (OPJ_SIZE_T)x0 * geometry->bytes_per_sample;
-      for (row = 0U; row < height; row++) {
+      for (OPJ_UINT32 row = 0U; row < height; row++) {
          memcpy(destination, source, row_size);
          destination += row_size;
          source += line_size;
       }
    }
-   return (OPJ_SIZE_T)(destination - tile_buffer);
+   *tile_size = copy_size;
+   return OPJ_TRUE;
 }
 
 static OPJ_BOOL encode(const asn1SccJpeg_Compression_Config *config, const image_geometry_t *geometry)
 {
-   opj_image_cmptparm_t component_parameters[4];
+   opj_image_cmptparm_t component_parameters[4] = { { 0 } };
    opj_image_t *image = NULL;
    opj_codec_t *codec = NULL;
    opj_stream_t *stream = NULL;
    OPJ_UINT8 *tile_buffer = NULL;
+   const OPJ_SIZE_T tile_buffer_size = (OPJ_SIZE_T)geometry->tile_width * geometry->tile_height *
+                                       geometry->num_components * geometry->bytes_per_sample;
    OPJ_BOOL single_tile = (geometry->tiles_x * geometry->tiles_y == 1U);
    OPJ_BOOL success = OPJ_FALSE;
-   OPJ_UINT32 i;
 
-   memset(component_parameters, 0, sizeof(component_parameters));
-   for (i = 0U; i < geometry->num_components; i++) {
+   for (OPJ_UINT32 i = 0U; i < geometry->num_components; i++) {
       component_parameters[i].dx = 1U;
       component_parameters[i].dy = 1U;
       component_parameters[i].w = geometry->width;
@@ -237,9 +262,7 @@ static OPJ_BOOL encode(const asn1SccJpeg_Compression_Config *config, const image
    // A single tile is passed directly from INPUT_BUFFER, which already has
    // the expected layout; otherwise each tile is gathered in a pool buffer
    if (!single_tile) {
-      tile_buffer = (OPJ_UINT8 *)opj_image_data_alloc((OPJ_SIZE_T)geometry->tile_width *
-                                                      geometry->tile_height * geometry->num_components *
-                                                      geometry->bytes_per_sample);
+      tile_buffer = (OPJ_UINT8 *)opj_image_data_alloc(tile_buffer_size);
    }
    // Image without sample data: samples are given tile by tile
    image = opj_image_tile_create(geometry->num_components, component_parameters,
@@ -249,7 +272,15 @@ static OPJ_BOOL encode(const asn1SccJpeg_Compression_Config *config, const image
    codec = opj_create_compress(OPJ_CODEC_J2K);
    stream = opj_stream_create(JPEGCOMPRESSOR_STREAM_CHUNK_SIZE, OPJ_FALSE);
 
-   if ((single_tile || (tile_buffer != NULL)) && (image != NULL) && (codec != NULL) && (stream != NULL)) {
+   // Encode only if every object above was created. They come from the
+   // memory pool, so a NULL means the pool is exhausted (reported as
+   // out-of-memory by compress()). The tile buffer is only needed when the
+   // image has several tiles.
+   const OPJ_BOOL tile_buffer_ready = single_tile || (tile_buffer != NULL);
+   const OPJ_BOOL encoder_ready = tile_buffer_ready && (image != NULL) && (codec != NULL) &&
+                                  (stream != NULL);
+
+   if (encoder_ready) {
       image->x0 = 0U;
       image->y0 = 0U;
       image->x1 = geometry->width;
@@ -263,14 +294,12 @@ static OPJ_BOOL encode(const asn1SccJpeg_Compression_Config *config, const image
          success = success &&
                    opj_write_tile(codec, 0U, INPUT_BUFFER, (OPJ_UINT32)geometry->image_size, stream);
       } else {
-         OPJ_UINT32 tile_y;
-         OPJ_UINT32 tile_x;
+         for (OPJ_UINT32 tile_y = 0U; success && (tile_y < geometry->tiles_y); tile_y++) {
+            for (OPJ_UINT32 tile_x = 0U; success && (tile_x < geometry->tiles_x); tile_x++) {
+               OPJ_SIZE_T tile_size = 0U;
 
-         for (tile_y = 0U; success && (tile_y < geometry->tiles_y); tile_y++) {
-            for (tile_x = 0U; success && (tile_x < geometry->tiles_x); tile_x++) {
-               OPJ_SIZE_T tile_size = gather_tile(geometry, tile_x, tile_y, tile_buffer);
-
-               success = opj_write_tile(codec, tile_y * geometry->tiles_x + tile_x,
+               success = gather_tile(geometry, tile_x, tile_y, tile_buffer, tile_buffer_size, &tile_size) &&
+                         opj_write_tile(codec, tile_y * geometry->tiles_x + tile_x,
                                         tile_buffer, (OPJ_UINT32)tile_size, stream);
             }
          }
@@ -293,8 +322,7 @@ static OPJ_BOOL encode(const asn1SccJpeg_Compression_Config *config, const image
 
 static asn1SccJpeg_Result_Code compress(const asn1SccJpeg_Compression_Config *config)
 {
-   image_geometry_t geometry;
-   asn1SccJpeg_Result_Code result;
+   image_geometry_t geometry = { 0 };
 
    compressor.output_size = 0U;
    compressor.output_overflow = OPJ_FALSE;
@@ -303,7 +331,7 @@ static asn1SccJpeg_Result_Code compress(const asn1SccJpeg_Compression_Config *co
    // previous (failed) compression, and the peak is the one of this request
    opj_mem_pool_init(opj_pool_buffer, sizeof(opj_pool_buffer));
 
-   result = check_config(config, &geometry);
+   const asn1SccJpeg_Result_Code result = check_config(config, &geometry);
    if (result != Jpeg_Result_Code_ok) {
       return result;
    }
@@ -329,9 +357,6 @@ static asn1SccJpeg_Result_Code compress(const asn1SccJpeg_Compression_Config *co
 
 void jpegcompressor_startup(void)
 {
-   // Write your initialisation code
-   // You may call sporadic required interfaces and start timers
-   // puts ("[JpegCompressor] Startup");
    opj_mem_pool_init(opj_pool_buffer, sizeof(opj_pool_buffer));
    compressor.state = Jpeg_Compressor_State_idle;
    compressor.last_result = Jpeg_Result_Code_ok;
@@ -357,8 +382,6 @@ void jpegcompressor_PI_read_buffer( const asn1SccJpeg_Read_Request *IN_request,
                                     asn1SccJpeg_Data_Chunk *OUT_data,
                                     asn1SccJpeg_Result_Code *OUT_result )
 {
-   OPJ_SIZE_T length;
-
    OUT_data->nCount = 0;
    if (compressor.state == Jpeg_Compressor_State_compressing) {
       *OUT_result = Jpeg_Result_Code_busy;
@@ -372,7 +395,7 @@ void jpegcompressor_PI_read_buffer( const asn1SccJpeg_Read_Request *IN_request,
       *OUT_result = Jpeg_Result_Code_invalid_offset;
       return;
    }
-   length = compressor.output_size - (OPJ_SIZE_T)IN_request->offset;
+   OPJ_SIZE_T length = compressor.output_size - (OPJ_SIZE_T)IN_request->offset;
    if (length > IN_request->length) {
       length = (OPJ_SIZE_T)IN_request->length;
    }
@@ -387,15 +410,15 @@ void jpegcompressor_PI_read_buffer( const asn1SccJpeg_Read_Request *IN_request,
 
 void jpegcompressor_PI_start_compression( const asn1SccJpeg_Compression_Config *IN_config )
 {
-   asn1SccJpeg_Compression_Result result;
-
    compressor.state = Jpeg_Compressor_State_compressing;
    compressor.last_result = compress(IN_config);
    compressor.state = (compressor.last_result == Jpeg_Result_Code_ok) ?
                       Jpeg_Compressor_State_completed : Jpeg_Compressor_State_failed;
 
-   result.result = compressor.last_result;
-   result.output_size = (asn1SccJpeg_Buffer_Size)compressor.output_size;
+   const asn1SccJpeg_Compression_Result result = {
+      .result = compressor.last_result,
+      .output_size = (asn1SccJpeg_Buffer_Size)compressor.output_size
+   };
    jpegcompressor_RI_compression_completed(&result);
 }
 
@@ -413,8 +436,7 @@ void jpegcompressor_PI_status( asn1SccJpeg_Compressor_Status *OUT_status )
 void jpegcompressor_PI_write_buffer( const asn1SccJpeg_Write_Request *IN_request,
                                      asn1SccJpeg_Result_Code *OUT_result )
 {
-   OPJ_SIZE_T offset = (OPJ_SIZE_T)IN_request->offset;
-   OPJ_SIZE_T length;
+   const OPJ_SIZE_T offset = (OPJ_SIZE_T)IN_request->offset;
 
    if (compressor.state == Jpeg_Compressor_State_compressing) {
       *OUT_result = Jpeg_Result_Code_busy;
@@ -425,7 +447,7 @@ void jpegcompressor_PI_write_buffer( const asn1SccJpeg_Write_Request *IN_request
       *OUT_result = Jpeg_Result_Code_invalid_offset;
       return;
    }
-   length = (OPJ_SIZE_T)IN_request->data.nCount;
+   const OPJ_SIZE_T length = (OPJ_SIZE_T)IN_request->data.nCount;
    // No gaps: the chunk must start inside or right after the uploaded data,
    // so that input_size bytes are always actually uploaded
    if ((IN_request->offset > compressor.input_size) ||
