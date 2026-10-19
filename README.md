@@ -1,1 +1,4 @@
 # taste-jpeg-2000
+TASTE JPEG 2000 component based on OPENJPEG, developed as a part of "Model-Based Execution Platform for Space Applications" project (contract 4000146882/24/NL/KK) financed by the European Space Agency.
+
+This repository contains a TASTE component that wraps the OPENJPEG library (https://github.com/uclouvain/openjpeg). The OPENJPEG library has been modified to use only static memory allocation. There are provided two test projects for Linux, SAMV71 and SAMRH71 targets. The component is ready for (re)use within ESA's [TASTE MBSE Toolchain](https://taste.tools/). The component needs an user provided bridge between the component and the rest of TASTE system to properly handle ASN.1 data types.
