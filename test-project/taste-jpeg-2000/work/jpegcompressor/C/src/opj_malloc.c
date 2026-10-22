@@ -88,6 +88,10 @@ static OPJ_BOOL opj_mem_initialized = OPJ_FALSE;
 static size_t opj_mem_used = 0U;
 static size_t opj_mem_peak = 0U;
 static size_t opj_mem_failures = 0U;
+/* Start of the first block, and highest pool offset ever used by a block:
+ * memory in use plus the free holes below it, i.e. the pool size needed */
+static OPJ_UINT8 *opj_mem_start = NULL;
+static size_t opj_mem_high_water = 0U;
 
 static INLINE size_t opj_mem_size(const opj_mem_block_t *b)
 {
@@ -139,6 +143,16 @@ static INLINE void opj_mem_account(size_t freed, size_t allocated)
     opj_mem_used = opj_mem_used - freed + allocated;
     if (opj_mem_used > opj_mem_peak) {
         opj_mem_peak = opj_mem_used;
+    }
+}
+
+/* Record the end of a block just allocated or grown */
+static INLINE void opj_mem_track_high_water(opj_mem_block_t *b)
+{
+    const size_t end = (size_t)((OPJ_UINT8 *)b + opj_mem_size(b) - opj_mem_start);
+
+    if (end > opj_mem_high_water) {
+        opj_mem_high_water = end;
     }
 }
 
@@ -284,6 +298,7 @@ static void *opj_mem_alloc(size_t alignment, size_t size)
     }
     opj_mem_shrink(b, needed_block_size);
     opj_mem_account(0U, opj_mem_size(b));
+    opj_mem_track_high_water(b);
 
     return opj_mem_payload(b);
 }
@@ -329,6 +344,7 @@ static void *opj_mem_realloc(void *ptr, size_t alignment, size_t new_size)
         opj_mem_set(b, old_size + opj_mem_size(next), OPJ_MEM_USED);
         opj_mem_shrink(b, block_size);
         opj_mem_account(old_size, opj_mem_size(b));
+        opj_mem_track_high_water(b);
         return ptr;
     }
 
@@ -358,6 +374,7 @@ OPJ_BOOL OPJ_CALLCONV opj_mem_pool_init(void *buffer, OPJ_SIZE_T size)
     opj_mem_used = 0U;
     opj_mem_peak = 0U;
     opj_mem_failures = 0U;
+    opj_mem_high_water = 0U;
 
     if (buffer == NULL) {
         return OPJ_FALSE;
@@ -372,6 +389,7 @@ OPJ_BOOL OPJ_CALLCONV opj_mem_pool_init(void *buffer, OPJ_SIZE_T size)
 
     first = (opj_mem_block_t *)(void *)start;
     first->prev_size = 0U;
+    opj_mem_start = start;
     opj_mem_set(first, size - OPJ_MEM_HDR_SIZE, 0U);
     sentinel = opj_mem_next(first);
     sentinel->size = OPJ_MEM_USED;
@@ -392,6 +410,11 @@ OPJ_SIZE_T OPJ_CALLCONV opj_mem_pool_get_used(void)
 OPJ_SIZE_T OPJ_CALLCONV opj_mem_pool_get_peak(void)
 {
     return opj_mem_peak;
+}
+
+OPJ_SIZE_T OPJ_CALLCONV opj_mem_pool_get_high_water(void)
+{
+    return opj_mem_high_water;
 }
 
 OPJ_SIZE_T OPJ_CALLCONV opj_mem_pool_get_failures(void)

@@ -53,7 +53,13 @@ RTEMS_SYSINIT_ITEM(set_flash_wait_states, RTEMS_SYSINIT_BSP_EARLY, RTEMS_SYSINIT
  * are identical on the boards, verified on SAMRH71). These references must
  * be updated when the compressor, its configuration or the test images
  * change.
+ * For each compression the encoder pool high-water mark (the pool size really
+ * needed) is recorded next to the peak of memory in use: the difference is
+ * the memory lost to fragmentation, the worst case is kept in
+ * test_worst_fragmentation_permille.
  */
+
+extern size_t jpegcompressor_get_memory_high_water(void);
 
 #define IMAGE_SIZE 64U
 #define MAX_IMAGE_SIZE (IMAGE_SIZE * IMAGE_SIZE * 2U)   // 1 component, 16 bits
@@ -74,6 +80,7 @@ typedef struct {
    unsigned output_size;            // compressed size in bytes
    unsigned long crc32;             // CRC-32 of the downloaded codestream
    unsigned long memory_peak;       // encoder pool peak usage in bytes
+   unsigned long memory_high_water; // pool size really needed: peak + fragmentation
    const char *failure;             // first failed check, NULL if the scenario passed
 } test_result_t;
 
@@ -100,6 +107,10 @@ volatile test_result_t test_results[SCENARIO_COUNT];
 volatile unsigned test_scenarios_done;
 volatile unsigned test_failures;
 volatile int test_finished;
+// Worst pool fragmentation: memory lost, in 1/1000 of the peak, and the index
+// of its scenario in test_results[]
+volatile unsigned long test_worst_fragmentation_permille;
+volatile unsigned test_worst_fragmentation_scenario;
 
 static unsigned char image[MAX_IMAGE_SIZE];
 
@@ -242,6 +253,15 @@ static void finish_scenario(const scenario_t *s)
    r->result = completion.result;
    r->output_size = (unsigned)completion.output_size;
    r->memory_peak = (unsigned long)status.memory_peak;
+   r->memory_high_water = (unsigned long)jpegcompressor_get_memory_high_water();
+   if (r->memory_peak > 0UL) {
+      const unsigned long fragmentation_permille =
+         ((r->memory_high_water - r->memory_peak) * 1000UL) / r->memory_peak;
+      if (fragmentation_permille > test_worst_fragmentation_permille) {
+         test_worst_fragmentation_permille = fragmentation_permille;
+         test_worst_fragmentation_scenario = current;
+      }
+   }
 
    if (completion.result != s->expected) {
       fail("unexpected compression result");
@@ -291,6 +311,8 @@ void test_env_startup(void)
    test_scenarios_done = 0;
    test_failures = 0;
    test_finished = 0;
+   test_worst_fragmentation_permille = 0UL;
+   test_worst_fragmentation_scenario = 0U;
 }
 
 void test_env_PI_compression_completed( const asn1SccJpeg_Compression_Result *IN_result )
