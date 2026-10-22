@@ -73,7 +73,10 @@ static struct {
    OPJ_SIZE_T input_size;       // bytes uploaded contiguously from offset 0
    OPJ_SIZE_T output_size;      // compressed bytes available
    OPJ_BOOL output_overflow;    // the compressed data did not fit
-} compressor = { Jpeg_Compressor_State_idle, Jpeg_Result_Code_ok, 0U, 0U, OPJ_FALSE };
+   OPJ_SIZE_T memory_peak;      // encoder pool peak usage of the last compression
+   OPJ_SIZE_T memory_leaked;    // pool bytes OpenJPEG had not freed at the end of the
+                                // last compression (expected 0, released anyway)
+} compressor = { Jpeg_Compressor_State_idle, Jpeg_Result_Code_ok, 0U, 0U, OPJ_FALSE, 0U, 0U };
 
 // Image geometry derived from the configuration
 typedef struct {
@@ -320,6 +323,20 @@ static OPJ_BOOL encode(const asn1SccJpeg_Compression_Config *config, const image
    return success;
 }
 
+static void release_encoder_memory(void)
+{
+   compressor.memory_peak = opj_mem_pool_get_peak();
+   compressor.memory_leaked = opj_mem_pool_get_used();
+   opj_mem_pool_init(opj_pool_buffer, sizeof(opj_pool_buffer));
+}
+
+// Pool bytes OpenJPEG had not freed at the end of the last compression
+// (expected 0; released by the pool reset anyway).
+OPJ_SIZE_T jpegcompressor_get_memory_leaked(void)
+{
+   return compressor.memory_leaked;
+}
+
 static asn1SccJpeg_Result_Code compress(const asn1SccJpeg_Compression_Config *config)
 {
    image_geometry_t geometry = { 0 };
@@ -327,27 +344,24 @@ static asn1SccJpeg_Result_Code compress(const asn1SccJpeg_Compression_Config *co
    compressor.output_size = 0U;
    compressor.output_overflow = OPJ_FALSE;
 
-   // Start every compression from an empty pool: nothing can leak from a
-   // previous (failed) compression, and the peak is the one of this request
-   opj_mem_pool_init(opj_pool_buffer, sizeof(opj_pool_buffer));
+   asn1SccJpeg_Result_Code result = check_config(config, &geometry);
+   if (result == Jpeg_Result_Code_ok) {
+      setup_parameters(config);
+      if (!encode(config, &geometry)) {
+         compressor.output_size = 0U;
+         if (compressor.output_overflow) {
+            result = Jpeg_Result_Code_output_overflow;
+         } else if (opj_mem_pool_get_failures() > 0U) {
+            result = Jpeg_Result_Code_out_of_memory;
+         } else {
+            result = Jpeg_Result_Code_codec_error;
+         }
+      }
+   }
 
-   const asn1SccJpeg_Result_Code result = check_config(config, &geometry);
-   if (result != Jpeg_Result_Code_ok) {
-      return result;
-   }
-   setup_parameters(config);
-
-   if (encode(config, &geometry)) {
-      return Jpeg_Result_Code_ok;
-   }
-   compressor.output_size = 0U;
-   if (compressor.output_overflow) {
-      return Jpeg_Result_Code_output_overflow;
-   }
-   if (opj_mem_pool_get_failures() > 0U) {
-      return Jpeg_Result_Code_out_of_memory;
-   }
-   return Jpeg_Result_Code_codec_error;
+   // Single exit: the pool is emptied after every compression
+   release_encoder_memory();
+   return result;
 }
 
 
@@ -362,6 +376,8 @@ void jpegcompressor_startup(void)
    compressor.last_result = Jpeg_Result_Code_ok;
    compressor.input_size = 0U;
    compressor.output_size = 0U;
+   compressor.memory_peak = 0U;
+   compressor.memory_leaked = 0U;
 }
 
 void jpegcompressor_PI_clear_buffer( asn1SccJpeg_Result_Code *OUT_result )
@@ -429,7 +445,7 @@ void jpegcompressor_PI_status( asn1SccJpeg_Compressor_Status *OUT_status )
    OUT_status->last_result = compressor.last_result;
    OUT_status->input_size = (asn1SccJpeg_Buffer_Size)compressor.input_size;
    OUT_status->output_size = (asn1SccJpeg_Buffer_Size)compressor.output_size;
-   OUT_status->memory_peak = (asn1SccJpeg_Compressor_Status_memory_peak)opj_mem_pool_get_peak();
+   OUT_status->memory_peak = (asn1SccJpeg_Compressor_Status_memory_peak)compressor.memory_peak;
 }
 
 

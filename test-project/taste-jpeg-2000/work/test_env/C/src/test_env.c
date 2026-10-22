@@ -19,9 +19,15 @@
  * checks the result, downloads the compressed data, saves it as
  * test_output/<name>.j2k (with the raw image in <name>.raw, for an external
  * comparison) and starts the next scenario.
+ * After every compression, successful or not, it also checks that OpenJPEG
+ * freed all its memory and that the encoder memory pool is empty.
  * Failures are printed; when all scenarios are done the process exits with
  * the number of failures as exit code.
  */
+
+// extern jpeg library functions, for memory check only
+extern size_t jpegcompressor_get_memory_leaked(void);
+extern size_t opj_mem_pool_get_used(void);
 
 #define MAX_IMAGE_SIZE (1024U * 1024U)
 
@@ -197,6 +203,12 @@ static void finish_scenario(const scenario_t *s)
           s->name, (int)completion.result, (int)s->expected, (unsigned)completion.output_size, raw,
           (unsigned long long)status.memory_peak);
 
+   if (jpegcompressor_get_memory_leaked() != 0U) {
+      fail("OpenJPEG did not free all its memory (memory leak)");
+   }
+   if (opj_mem_pool_get_used() != 0U) {
+      fail("encoder memory pool not empty after the compression");
+   }
    if (completion.result != s->expected) {
       fail("unexpected compression result");
       return;
