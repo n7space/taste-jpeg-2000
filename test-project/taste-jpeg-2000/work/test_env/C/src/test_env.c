@@ -21,12 +21,16 @@
  * comparison) and starts the next scenario.
  * After every compression, successful or not, it also checks that OpenJPEG
  * freed all its memory and that the encoder memory pool is empty.
+ * For each compression it also prints the encoder pool fragmentation: the
+ * pool high-water mark (pool size really needed) compared with the peak of
+ * memory in use; the worst case is printed at the end.
  * Failures are printed; when all scenarios are done the process exits with
  * the number of failures as exit code.
  */
 
 // extern jpeg library functions, for memory check only
 extern size_t jpegcompressor_get_memory_leaked(void);
+extern size_t jpegcompressor_get_memory_high_water(void);
 extern size_t opj_mem_pool_get_used(void);
 
 #define MAX_IMAGE_SIZE (1024U * 1024U)
@@ -70,6 +74,9 @@ static int waiting;
 static int completed;
 static asn1SccJpeg_Compression_Result completion;
 static int failures;
+// Worst pool fragmentation over the scenarios: memory lost, in % of the peak
+static double worst_fragmentation;
+static const char *worst_fragmentation_name = "none";
 
 static void fail(const char *what)
 {
@@ -199,9 +206,19 @@ static void finish_scenario(const scenario_t *s)
    unsigned raw = image_size(&s->config);
 
    test_env_RI_status(&status);
-   printf("[test_env] %-26s result=%d (expected %d) size=%7u/%7u B  pool peak=%8llu B\n",
+   // Fragmentation: pool size really needed (high-water) beyond the peak in use
+   const size_t high_water = jpegcompressor_get_memory_high_water();
+   const double fragmentation = (status.memory_peak > 0U)
+      ? 100.0 * ((double)high_water - (double)status.memory_peak) / (double)status.memory_peak
+      : 0.0;
+   if (fragmentation > worst_fragmentation) {
+      worst_fragmentation = fragmentation;
+      worst_fragmentation_name = s->name;
+   }
+   printf("[test_env] %-26s result=%d (expected %d) size=%7u/%7u B  pool peak=%8llu B"
+          "  high-water=%8zu B (+%.1f%%)\n",
           s->name, (int)completion.result, (int)s->expected, (unsigned)completion.output_size, raw,
-          (unsigned long long)status.memory_peak);
+          (unsigned long long)status.memory_peak, high_water, fragmentation);
 
    if (jpegcompressor_get_memory_leaked() != 0U) {
       fail("OpenJPEG did not free all its memory (memory leak)");
@@ -281,6 +298,8 @@ void test_env_PI_trigger( void )
          current++; // could not start, failure already counted
       }
    }
+   printf("[test_env] worst pool fragmentation: +%.1f%% (%s)\n", worst_fragmentation,
+          worst_fragmentation_name);
    printf("[test_env] %u scenarios, %d failure(s)\n", (unsigned)SCENARIO_COUNT, failures);
    fflush(stdout);
    _Exit(failures); // not exit(): it hangs in the TASTE runtime (observed on Linux)

@@ -76,7 +76,9 @@ static struct {
    OPJ_SIZE_T memory_peak;      // encoder pool peak usage of the last compression
    OPJ_SIZE_T memory_leaked;    // pool bytes OpenJPEG had not freed at the end of the
                                 // last compression (expected 0, released anyway)
-} compressor = { Jpeg_Compressor_State_idle, Jpeg_Result_Code_ok, 0U, 0U, OPJ_FALSE, 0U, 0U };
+   OPJ_SIZE_T memory_high_water; // highest pool offset used by the last compression:
+                                 // memory_peak plus the memory lost to fragmentation
+} compressor = { Jpeg_Compressor_State_idle, Jpeg_Result_Code_ok, 0U, 0U, OPJ_FALSE, 0U, 0U, 0U };
 
 // Image geometry derived from the configuration
 typedef struct {
@@ -327,6 +329,7 @@ static void release_encoder_memory(void)
 {
    compressor.memory_peak = opj_mem_pool_get_peak();
    compressor.memory_leaked = opj_mem_pool_get_used();
+   compressor.memory_high_water = opj_mem_pool_get_high_water();
    opj_mem_pool_init(opj_pool_buffer, sizeof(opj_pool_buffer));
 }
 
@@ -335,6 +338,14 @@ static void release_encoder_memory(void)
 OPJ_SIZE_T jpegcompressor_get_memory_leaked(void)
 {
    return compressor.memory_leaked;
+}
+
+// Highest pool offset used by the last compression: the pool size it really
+// needed, including the memory lost to fragmentation (compare with the status
+// memory-peak). Not a TASTE interface: used by the Linux test (test_env).
+OPJ_SIZE_T jpegcompressor_get_memory_high_water(void)
+{
+   return compressor.memory_high_water;
 }
 
 static asn1SccJpeg_Result_Code compress(const asn1SccJpeg_Compression_Config *config)
@@ -378,6 +389,7 @@ void jpegcompressor_startup(void)
    compressor.output_size = 0U;
    compressor.memory_peak = 0U;
    compressor.memory_leaked = 0U;
+   compressor.memory_high_water = 0U;
 }
 
 void jpegcompressor_PI_clear_buffer( asn1SccJpeg_Result_Code *OUT_result )
